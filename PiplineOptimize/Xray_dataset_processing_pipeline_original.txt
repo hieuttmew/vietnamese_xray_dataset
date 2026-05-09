@@ -1,0 +1,1924 @@
+Tui gửi thông tin nha bro:
+Bước 1: OCR text trong hình X-Quang.
+Đây là code ExtractTextData/main_3.py:
+import os
+import time
+import torch
+import pandas as pd
+import concurrent.futures
+from tqdm import tqdm
+from doctr.io import DocumentFile
+from doctr.models import ocr_predictor
+from multiprocessing import cpu_count
+
+# ==== CONFIG ====
+root_dir = "../XQUANG"       # ⚙️ folder chứa X-ray
+output_csv = "ocr_results.csv"
+checkpoint_every = 200        # Lưu checkpoint sau mỗi 200 ảnh (OK)
+
+# --- CẢI TIẾN ---
+# Dùng nhiều nhân CPU hơn để đọc file
+num_workers = min(4, cpu_count() * 2) 
+# Batch size cho GPU: Tận dụng 12GB VRAM
+# Thử 32 hoặc 64. Nếu lỗi "Out of Memory", giảm xuống 16.
+GPU_BATCH_SIZE = 128 
+# --- KẾT THÚC CẢI TIẾN ---
+
+# ==== DEVICE & MODEL ====
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🧠 Using device: {device}")
+# CẢI TIẾN: Báo cho model biết batch size để nó tối ưu
+model = ocr_predictor(pretrained=True).to(device)
+
+# ==== RESUME FROM CHECKPOINT ====
+processed_files = set()
+if os.path.exists(output_csv):
+    df_existing = pd.read_csv(output_csv)
+    processed_files = set(df_existing["file_path"].tolist())
+    print(f"🔁 Resume mode: {len(processed_files)} already processed")
+
+# ==== COLLECT IMAGES ====
+image_paths = []
+for root, _, files in os.walk(root_dir):
+    for file in files:
+        if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tif')):
+            full_path = os.path.join(root, file)
+            if full_path not in processed_files:
+                image_paths.append(full_path)
+
+print(f"📂 Found {len(image_paths)} new images to process")
+
+# ==== UTILS ====
+def load_doc(path):
+    """Hàm load file (giữ nguyên)"""
+    try:
+        # DocumentFile.from_images là nơi CPU làm việc nặng
+        return (path, DocumentFile.from_images(path))
+    except Exception as e:
+        # print(f"⚠️ Error loading {path}: {e}")
+        return (path, None) # Trả về None để biết là lỗi
+
+def extract_text_from_output(output):
+    """Ghép toàn bộ text của ảnh thành 1 dòng (giữ nguyên)"""
+    return " ".join([
+        word.value
+        for page in output.pages
+        for block in page.blocks
+        for line in block.lines
+        for word in line.words
+    ]).replace("\n", " ").strip()
+
+# ==== MAIN LOOP (ĐÃ CẤU TRÚC LẠI) ====
+results = []
+start_time = time.time()
+total_processed_count = 0
+
+# Dùng ThreadPoolExecutor để quản lý các luồng I/O
+with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+    
+    # Chia danh sách tất cả các ảnh thành các lô (batch)
+    for i in tqdm(range(0, len(image_paths), GPU_BATCH_SIZE), desc="🚀 Processing Batches"):
+        
+        batch_paths = image_paths[i : i + GPU_BATCH_SIZE]
+        
+        # 1. LOAD BATCH (DÙNG CPU SONG SONG)
+        # executor.map sẽ chạy hàm load_doc cho mọi ảnh trong 
+        # batch_paths, sử dụng num_workers luồng
+        doc_data_batch = list(executor.map(load_doc, batch_paths))
+        
+        # Lọc ra các ảnh load thành công
+        valid_docs = []
+        valid_paths = []
+        for path, doc in doc_data_batch:
+            if doc:
+                valid_docs.append(doc)
+                valid_paths.append(path)
+            else:
+                print(f"⚠️ Bỏ qua file lỗi: {path}")
+
+        if not valid_docs:
+            continue
+
+        # 2. INFERENCE (DÙNG GPU) VÀ 3. EXTRACT TEXT (DÙNG CPU)
+        # Lặp qua từng (đường dẫn, tài liệu) đã được load thành công trong batch
+        for path, doc in zip(valid_paths, valid_docs):
+            try:
+                # 🧠 Chạy model trên TỪNG ảnh (GPU làm việc)
+                # CPU thread này sẽ chờ (nghỉ) trong khi GPU xử lý
+                output = model(doc) 
+                
+                # 🧩 Extract text (CPU làm việc)
+                text = extract_text_from_output(output)
+                results.append({"file_path": path, "extracted_text": text})
+                total_processed_count += 1
+                
+            except Exception as e:
+                # Nếu 1 ảnh bị lỗi, in lỗi và bỏ qua CHỈ ảnh đó
+                print(f"💥 Lỗi khi infer ảnh {path}: {e}")
+                continue # Bỏ qua ảnh lỗi, tiếp tục ảnh tiếp theo
+
+        # 4. CHECKPOINT (Logic giữ nguyên, nhưng hiệu quả hơn)
+        # Lưu checkpoint khi đã tích đủ
+        if len(results) >= checkpoint_every:
+            df = pd.DataFrame(results)
+            write_mode = "a" if os.path.exists(output_csv) else "w"
+            header = not os.path.exists(output_csv)
+            
+            df.to_csv(output_csv, mode=write_mode, index=False, header=header)
+            
+            # print(f"💾 Checkpoint saved ({len(results)} new records)")
+            results = [] # Xóa bộ đệm sau khi lưu
+
+# ==== SAVE FINAL ====
+if results:
+    df = pd.DataFrame(results)
+    write_mode = "a" if os.path.exists(output_csv) else "w"
+    header = not os.path.exists(output_csv)
+    df.to_csv(output_csv, mode=write_mode, index=False, header=header)
+
+end_time = time.time()
+print(f"✅ Done! Processed {total_processed_count} images.")
+print(f"Total time: {(end_time - start_time)/60:.2f} min")
+
+=> Sau khi chạy code này xong thì sẽ ra 1 file ocr_result.csv với 38681 dòng (là 38k hình 50GB data), tui gửi cấu trúc và dòng đầu tiên:
+file_path,extracted_text
+../XQUANG\20240226\20240226013\20240226013_20240226084723.jpg,"TTYT-HUYEN DUC TRONG Series 1 20240226013 Image 1 MA THI NGUYET 1973 C-SPINE AP Unit: cm 26/02/2024 08:47:23 Pixel for Pixel, Mag: 1.00X Admin W: 21406 L: 10703"
+...
+Tui copy lưu ra 1 file mới là raw_data.csv để cho bước tiếp theo.
+
+Bước 2: Clean text data.
+Từ file raw_data.csv sẽ đi qua code CleaningData/main_2.py để loại bỏ những text thừa như sau:
+# re_clean_raw_data.py
+import re
+import pandas as pd
+from datetime import datetime
+
+INPUT = "raw_data.csv"
+OUTPUT = "cleaned_data_2.csv"
+
+# regex mẫu
+RE_DATE = re.compile(r'(\d{2}/\d{2}/\d{4}\s*\d{0,2}:?\d{0,2}:?\d{0,2})')
+RE_NAME = re.compile(r'([A-ZÀ-Ỹ][A-ZÀ-Ỹ\s\.]+)\s+((19|20)\d{2})', re.UNICODE)
+RE_XRAY = re.compile(r'([A-Z\-]+\s*(?:AP|LAT|PA|OBL|VIEW)?)', re.UNICODE)
+
+# danh sách các cụm nhiễu thường gặp
+NOISE_WORDS = [
+    "TTYT", "HUYEN", "TRUNG", "TAM", "Y", "TE", "DUC", "TRONG",
+    "CENTER", "BENH", "VIEN", "PKDK", "PHONG KHAM"
+]
+NOISE_PATTERN = re.compile(r'\b(?:' + '|'.join(NOISE_WORDS) + r')\b', re.IGNORECASE)
+
+
+def clean_noise(text):
+    """Xóa các cụm chữ nhiễu (TTYT-HUYEN DUC TRONG, ...) nhưng giữ nguyên phần còn lại"""
+    text = re.sub(r'[-_]', ' ', text)
+    text = re.sub(NOISE_PATTERN, '', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    return text.strip()
+
+
+def extract_datetime(text):
+    m = RE_DATE.search(text)
+    if m:
+        s = m.group(1).strip()
+        # normalize format
+        try:
+            if len(s.split()) == 2:
+                return datetime.strptime(s, "%d/%m/%Y %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                return datetime.strptime(s, "%d/%m/%Y").strftime("%Y-%m-%d")
+        except:
+            pass
+    return ""
+
+
+def extract_name_birth(text):
+    m = RE_NAME.search(text)
+    if m:
+        return m.group(1).strip(), m.group(2)
+    return "", ""
+
+
+def extract_xray_type(text):
+    """
+    Tìm loại ảnh X-quang dựa trên pattern in hoa như 'C-SPINE AP', 'CHEST PA', ...
+    """
+    candidates = RE_XRAY.findall(text)
+    filtered = [c.strip() for c in candidates if len(c) >= 3 and not re.match(r'^(SERIES|IMAGE|UNIT|PIXEL|ADMIN|W|L)$', c)]
+    if filtered:
+        # chọn cái dài nhất
+        return max(filtered, key=len)
+    return ""
+
+
+def main():
+    df = pd.read_csv(INPUT, dtype=str, keep_default_na=False)
+    results = []
+
+    for i, row in df.iterrows():
+        fp = row.get("file_path", "")
+        text = row.get("extracted_text", "")
+        if not text:
+            continue
+
+        text = clean_noise(text)
+        datetime_str = extract_datetime(text)
+        name, birth = extract_name_birth(text)
+        xray_type = extract_xray_type(text)
+
+        results.append({
+            "filepath": fp,
+            "patient_name": name,
+            "birth_year": birth,
+            "xray_type": xray_type,
+            "datetime": datetime_str
+        })
+
+        if i % 5000 == 0 and i > 0:
+            print(f"Processed {i} rows...")
+
+    out = pd.DataFrame(results)
+    out.to_csv(OUTPUT, index=False)
+    print(f"✅ Done! Saved recovered file to: {OUTPUT}")
+
+
+if __name__ == "__main__":
+    main()
+
+=> Kết quả thu về một file cleaned_data_2.csv (38681 dòng) với cấu trúc như sau:
+filepath,patient_name,birth_year,xray_type,datetime
+../XQUANG\20240226\20240226013\20240226013_20240226084723.jpg,MA THI NGUYET,1973,SPINE AP,2024-02-26 08:47:23
+...
+
+Sau đó, từ cleaned_data_2.csv qua code notebook CleaningData/processing_missing_data.ipynb để cứu lại những file hình bị thiếu data sau khi OCR và clean:
+# %%
+import pandas as pd
+
+# %%
+df = pd.read_csv('cleaned_data_2.csv')
+df.head()
+
+# %%
+# Keep row data that empty cells in 'patient_name' or 'birth_year' or 'xray_type' columns
+df_missing = df[df['patient_name'].isnull() | df['birth_year'].isnull() | df['xray_type'].isnull()]
+df_missing.to_csv('missing_data.csv', index=False)
+
+# %%
+# Convert cells in 'xray_type' column that not contain C-SPINE|CERVICAL|CHEST|THORAX|L-SPINE|T-SPINE|KUB|ABDOMEN|PELVIS|KNEE|SHOULDER|AP|LAT values to string empty
+df_missing.loc[~df_missing['xray_type'].str.contains('C-SPINE|CERVICAL|CHEST|THORAX|L-SPINE|T-SPINE|KUB|ABDOMEN|PELVIS|KNEE|SHOULDER|AP|LAT', na=False), 'xray_type'] = ''
+df_missing.to_csv('missing_data.csv', index=False)
+
+# %%
+df_missing_clone = pd.read_csv('missing_data.csv')
+
+# %%
+# Split missing data into 2 parts: missing patient_name or birth_year and having xray_type; and missing all patient_name, birth_year and xray_type
+df_missing_name_year = df_missing_clone[(df_missing_clone['patient_name'].isnull() | df_missing_clone['birth_year'].isnull()) & df_missing_clone['xray_type'].notnull()]
+df_missing_all = df_missing_clone[df_missing_clone['patient_name'].isnull() & df_missing_clone['birth_year'].isnull() & df_missing_clone['xray_type'].isnull()]
+df_missing_name_year.to_csv('missing_name_or_year_data.csv', index=False)
+df_missing_all.to_csv('missing_all_important_data.csv', index=False)
+
+# %%
+df_missing_name_year = pd.read_csv('missing_name_or_year_data.csv')
+df_missing_name_year.head()
+
+# %%
+# Show the first images with missing patient_name or birth_year but having xray_type
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+for i in range(5):
+    img_path = df_missing_name_year.iloc[i]['filepath']
+    img = mpimg.imread("../" + img_path)
+    plt.imshow(img, cmap='gray')
+    plt.title(f"Image Path: {img_path}")
+    plt.axis('off')
+    plt.show()
+
+# %%
+import cv2
+for i in range(1):
+    img_path = df_missing_name_year.iloc[i]['filepath']
+    img = cv2.imread("../" + img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Crop the image to focus on the main area (example values, adjust as needed)
+    gray = gray[0:500, 0:1000]
+    plt.imshow(gray, cmap='gray')
+    plt.title(f"Image Path: {img_path}")
+    plt.axis('off')
+    plt.show()
+
+# %%
+len(df_missing_name_year)
+
+# %%
+# Extract text from images with missing patient_name or birth_year but having xray_type using OCR (Optical Character Recognition) (not use pytesseract)
+import cv2
+import numpy as np
+import easyocr
+reader = easyocr.Reader(['en'])
+for i in range(len(df_missing_name_year)):
+    img_path = df_missing_name_year.iloc[i]['filepath']
+    img = cv2.imread("../" + img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = gray[0:500, 0:1000]
+    results = reader.readtext(gray)
+    patient_name = str(results[2][1])
+    # Update the 'patient_name' column in the dataframe
+    df_missing_name_year.at[i, 'patient_name'] = patient_name
+    print(f"{i + 1}: Extracted patient_name: {patient_name} from image: {img_path}")
+
+df_missing_name_year.to_csv('missing_name_or_year_data_filled.csv', index=False)
+
+
+# %%
+img_path = '../XQUANG/20240227/20240227040/20240227040_20240227143845.jpg'
+img = mpimg.imread("../" + img_path)
+plt.imshow(img, cmap='gray')
+plt.title(f"Image Path: {img_path}")
+plt.axis('off')
+plt.show()
+
+# %%
+df_missing_name_year_filled = pd.read_csv('missing_name_or_year_data_filled.csv')
+df_missing_name_year_filled.head()
+
+# %%
+# Remove number, special characters from 'patient_name' column and uppercase all letters
+df_missing_name_year_filled['patient_name'] = df_missing_name_year_filled['patient_name'].str.replace(r'[^a-zA-Z\s]', '', regex=True).str.upper()
+df_missing_name_year_filled.head()
+df_missing_name_year_filled.to_csv('missing_name_or_year_data_filled.csv', index=False)
+
+# %%
+import pandas as pd
+
+# 1. Đọc dữ liệu từ 2 file csv
+# Giả sử file bị thiếu là 'file_thieu.csv' và file dùng để fill là 'file_fill.csv'
+df_missing = pd.read_csv('cleaned_data_2.csv')
+df_full = pd.read_csv('missing_name_or_year_data_filled.csv')
+
+# 2. Thiết lập cột 'filepath' làm index (chỉ mục) cho cả 2 dataframe
+# Bước này cực kỳ quan trọng để pandas biết dòng nào khớp với dòng nào
+df_missing.set_index('filepath', inplace=True)
+df_full.set_index('filepath', inplace=True)
+
+# 3. Sử dụng combine_first để điền dữ liệu
+# Logic: Giữ nguyên dữ liệu của df_missing, CHỈ KHI NÀO gặp giá trị trống (NaN)
+# thì mới lấy giá trị tương ứng từ df_full đắp vào.
+df_result = df_missing.combine_first(df_full)
+
+# 4. Reset index để đưa 'filepath' quay trở lại thành một cột bình thường
+df_result.reset_index(inplace=True)
+
+# (Tuỳ chọn) Định dạng lại cột birth_year
+# Khi đọc file có dữ liệu trống, pandas thường chuyển số thành dạng float (vd: 1990.0)
+# Dòng này giúp chuyển lại về số nguyên (1990) nếu muốn đẹp hơn
+# Lưu ý: Chỉ chạy được dòng này nếu sau khi merge cột birth_year không còn ô nào trống
+if df_result['birth_year'].isnull().sum() == 0:
+    df_result['birth_year'] = df_result['birth_year'].astype(int)
+
+# 5. Lưu ra file mới
+df_result.to_csv('cleaned_data_3.csv', index=False)
+
+# %% [markdown]
+# ---
+
+# %%
+import pandas as pd
+
+df_3 = pd.read_csv('cleaned_data_3.csv')
+df_3.head()
+
+# Keep row data that empty cells in 'patient_name' or 'birth_year' or 'xray_type' columns
+df_3_missing = df_3[df_3['patient_name'].isnull() | df_3['birth_year'].isnull() | df_3['xray_type'].isnull()]
+df_3_missing.to_csv('3/missing_data.csv', index=False)
+
+# Convert cells in 'xray_type' column that not contain C-SPINE|CERVICAL|CHEST|THORAX|L-SPINE|T-SPINE|KUB|ABDOMEN|PELVIS|KNEE|SHOULDER|AP|LAT values to string empty
+df_3_missing.loc[~df_3_missing['xray_type'].str.contains('C-SPINE|CERVICAL|CHEST|THORAX|L-SPINE|T-SPINE|KUB|ABDOMEN|PELVIS|KNEE|SHOULDER|AP|LAT', na=False), 'xray_type'] = ''
+df_3_missing.to_csv('3/missing_data.csv', index=False)
+
+df_3_missing_clone = pd.read_csv('3/missing_data.csv')
+
+# Split missing data into 2 parts: missing patient_name or birth_year and having xray_type; and missing all patient_name, birth_year and xray_type
+df_3_missing_name_year = df_3_missing_clone[(df_3_missing_clone['patient_name'].isnull() | df_3_missing_clone['birth_year'].isnull()) & df_3_missing_clone['xray_type'].notnull()]
+df_3_missing_all = df_3_missing_clone[df_3_missing_clone['patient_name'].isnull() & df_3_missing_clone['birth_year'].isnull() & df_3_missing_clone['xray_type'].isnull()]
+df_3_missing_name_year.to_csv('3/missing_name_or_year_data.csv', index=False)
+df_3_missing_all.to_csv('3/missing_all_important_data.csv', index=False)
+
+# %%
+import cv2
+for i in range(1):
+    img_path = df_3_missing_all.iloc[i]['filepath']
+    img = cv2.imread("../" + img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Crop the image to focus on the main area (example values, adjust as needed)
+    gray = gray[0:500, 0:1000]
+    plt.imshow(gray, cmap='gray')
+    plt.title(f"Image Path: {img_path}")
+    plt.axis('off')
+    plt.show()
+
+# %%
+import easyocr
+reader = easyocr.Reader(['en'])
+df_3_missing_all = pd.read_csv('3/missing_all_data_filled.csv')
+for i in range(1420, len(df_3_missing_all)):
+    img_path = df_3_missing_all.iloc[i]['filepath']
+    img = cv2.imread("../" + img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = gray[0:500, 0:1000]
+    results = reader.readtext(gray)
+    patient_name = str(results[2][1])
+    x_ray_type = str(results[3][1])
+    df_3_missing_all.at[i, 'patient_name'] = patient_name
+    df_3_missing_all.at[i, 'xray_type'] = x_ray_type
+    print(f"{i + 1}: Extracted patient_name: {patient_name} - x-ray type: {x_ray_type} - from image: {img_path}")
+
+df_3_missing_all.to_csv('3/missing_all_data_filled.csv', index=False)
+
+# %%
+df_3_missing_all_filled = pd.read_csv('3/missing_all_data_filled.csv')
+df_3_missing_all_filled['patient_name'] = df_3_missing_all_filled['patient_name'].str.replace(r'[^a-zA-Z\s]', '', regex=True).str.upper()
+df_3_missing_all_filled.head()
+df_3_missing_all_filled.to_csv('3/missing_all_data_filled.csv', index=False)
+
+# %%
+import pandas as pd
+
+# 1. Đọc dữ liệu từ 2 file csv
+# Giả sử file bị thiếu là 'file_thieu.csv' và file dùng để fill là 'file_fill.csv'
+df_missing = pd.read_csv('cleaned_data_3.csv')
+df_full = pd.read_csv('3/missing_all_data_filled.csv')
+
+# 2. Thiết lập cột 'filepath' làm index (chỉ mục) cho cả 2 dataframe
+# Bước này cực kỳ quan trọng để pandas biết dòng nào khớp với dòng nào
+df_missing.set_index('filepath', inplace=True)
+df_full.set_index('filepath', inplace=True)
+
+# 3. Sử dụng combine_first để điền dữ liệu
+# Logic: Giữ nguyên dữ liệu của df_missing, CHỈ KHI NÀO gặp giá trị trống (NaN)
+# thì mới lấy giá trị tương ứng từ df_full đắp vào.
+df_result = df_missing.combine_first(df_full)
+
+# 4. Reset index để đưa 'filepath' quay trở lại thành một cột bình thường
+df_result.reset_index(inplace=True)
+
+# (Tuỳ chọn) Định dạng lại cột birth_year
+# Khi đọc file có dữ liệu trống, pandas thường chuyển số thành dạng float (vd: 1990.0)
+# Dòng này giúp chuyển lại về số nguyên (1990) nếu muốn đẹp hơn
+# Lưu ý: Chỉ chạy được dòng này nếu sau khi merge cột birth_year không còn ô nào trống
+if df_result['birth_year'].isnull().sum() == 0:
+    df_result['birth_year'] = df_result['birth_year'].astype(int)
+
+# 5. Lưu ra file mới
+df_result.to_csv('cleaned_data_4.csv', index=False)
+
+# %% [markdown]
+# ---
+
+# %%
+import pandas as pd
+
+df_4 = pd.read_csv('cleaned_data_4.csv')
+df_4.head()
+
+# Keep row data that empty cells in 'patient_name' or 'birth_year' or 'xray_type' columns
+df_4_missing = df_4[df_4['patient_name'].isnull() | df_4['birth_year'].isnull() | df_4['xray_type'].isnull()]
+df_4_missing.to_csv('4/missing_data.csv', index=False)
+
+# Convert cells in 'xray_type' column that not contain C-SPINE|CERVICAL|CHEST|THORAX|L-SPINE|T-SPINE|KUB|ABDOMEN|PELVIS|KNEE|SHOULDER|AP|LAT values to string empty
+df_4_missing.loc[~df_4_missing['xray_type'].str.contains('C-SPINE|CERVICAL|CHEST|THORAX|L-SPINE|T-SPINE|KUB|ABDOMEN|PELVIS|KNEE|SHOULDER|AP|LAT', na=False), 'xray_type'] = ''
+df_4_missing.to_csv('4/missing_data.csv', index=False)
+
+df_4_missing_clone = pd.read_csv('4/missing_data.csv')
+
+# Split missing data into 2 parts: missing patient_name or birth_year and having xray_type; and missing all patient_name, birth_year and xray_type
+df_4_missing_name_year = df_4_missing_clone[(df_4_missing_clone['patient_name'].isnull() | df_4_missing_clone['birth_year'].isnull()) & df_4_missing_clone['xray_type'].notnull()]
+df_4_missing_all = df_4_missing_clone[df_4_missing_clone['patient_name'].isnull() & df_4_missing_clone['birth_year'].isnull() & df_4_missing_clone['xray_type'].isnull()]
+df_4_missing_name_year.to_csv('4/missing_name_or_year_data.csv', index=False)
+df_4_missing_all.to_csv('4/missing_all_important_data.csv', index=False)
+
+# %%
+import pandas as pd
+import cv2
+import easyocr
+reader = easyocr.Reader(['en'])
+df_4_missing_all = pd.read_csv('4/missing_all_important_data.csv')
+for i in range(len(df_4_missing_all)):
+    img_path = df_4_missing_all.iloc[i]['filepath']
+    img = cv2.imread("../" + img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = gray[0:500, 0:1000]
+    results = reader.readtext(gray)
+    patient_name = str(results[2][1])
+    x_ray_type = str(results[3][1])
+    df_4_missing_all.at[i, 'patient_name'] = patient_name
+    df_4_missing_all.at[i, 'xray_type'] = x_ray_type
+    print(f"{i + 1}: Extracted patient_name: {patient_name} - x-ray type: {x_ray_type} - from image: {img_path}")
+
+df_4_missing_all.to_csv('4/missing_all_data_filled.csv', index=False)
+
+# %%
+df_4_missing_all_filled = pd.read_csv('4/missing_all_data_filled.csv')
+df_4_missing_all_filled['patient_name'] = df_4_missing_all_filled['patient_name'].str.replace(r'[^a-zA-Z\s]', '', regex=True).str.upper()
+df_4_missing_all_filled.head()
+df_4_missing_all_filled.to_csv('4/missing_all_data_filled.csv', index=False)
+
+# %%
+import pandas as pd
+
+# 1. Đọc dữ liệu từ 2 file csv
+# Giả sử file bị thiếu là 'file_thieu.csv' và file dùng để fill là 'file_fill.csv'
+df_missing = pd.read_csv('cleaned_data_4.csv')
+df_full = pd.read_csv('4/missing_all_data_filled.csv')
+
+# 2. Thiết lập cột 'filepath' làm index (chỉ mục) cho cả 2 dataframe
+# Bước này cực kỳ quan trọng để pandas biết dòng nào khớp với dòng nào
+df_missing.set_index('filepath', inplace=True)
+df_full.set_index('filepath', inplace=True)
+
+# 3. Sử dụng combine_first để điền dữ liệu
+# Logic: Giữ nguyên dữ liệu của df_missing, CHỈ KHI NÀO gặp giá trị trống (NaN)
+# thì mới lấy giá trị tương ứng từ df_full đắp vào.
+df_result = df_missing.combine_first(df_full)
+
+# 4. Reset index để đưa 'filepath' quay trở lại thành một cột bình thường
+df_result.reset_index(inplace=True)
+
+# (Tuỳ chọn) Định dạng lại cột birth_year
+# Khi đọc file có dữ liệu trống, pandas thường chuyển số thành dạng float (vd: 1990.0)
+# Dòng này giúp chuyển lại về số nguyên (1990) nếu muốn đẹp hơn
+# Lưu ý: Chỉ chạy được dòng này nếu sau khi merge cột birth_year không còn ô nào trống
+if df_result['birth_year'].isnull().sum() == 0:
+    df_result['birth_year'] = df_result['birth_year'].astype(int)
+
+# 5. Lưu ra file mới
+df_result.to_csv('cleaned_data_5.csv', index=False)
+
+# %% [markdown]
+# ---
+
+# %%
+import pandas as pd
+
+df_5 = pd.read_csv('cleaned_data_5.csv')
+df_5.head()
+
+# Keep row data that empty cells in 'patient_name' or 'birth_year' or 'xray_type' columns
+df_5_missing = df_5[df_5['patient_name'].isnull() | df_5['birth_year'].isnull() | df_5['xray_type'].isnull()]
+df_5_missing.to_csv('5/missing_data.csv', index=False)
+
+# Convert cells in 'xray_type' column that not contain C-SPINE|CERVICAL|CHEST|THORAX|L-SPINE|T-SPINE|KUB|ABDOMEN|PELVIS|KNEE|SHOULDER|AP|LAT values to string empty
+df_5_missing.loc[~df_5_missing['xray_type'].str.contains('C-SPINE|CERVICAL|CHEST|THORAX|L-SPINE|T-SPINE|KUB|ABDOMEN|PELVIS|KNEE|SHOULDER|AP|LAT', na=False), 'xray_type'] = ''
+df_5_missing.to_csv('5/missing_data.csv', index=False)
+
+df_5_missing_clone = pd.read_csv('5/missing_data.csv')
+
+# Split missing data into 2 parts: missing patient_name or birth_year and having xray_type; and missing all patient_name, birth_year and xray_type
+df_5_missing_name_year = df_5_missing_clone[(df_5_missing_clone['patient_name'].isnull() | df_5_missing_clone['birth_year'].isnull()) & df_5_missing_clone['xray_type'].notnull()]
+df_5_missing_all = df_5_missing_clone[df_5_missing_clone['patient_name'].isnull() & df_5_missing_clone['birth_year'].isnull() & df_5_missing_clone['xray_type'].isnull()]
+df_5_missing_name_year.to_csv('5/missing_name_or_year_data.csv', index=False)
+df_5_missing_all.to_csv('5/missing_all_important_data.csv', index=False)
+
+
+Sau khi chạy xong hết các cell code ở trên thì cho ra file cleaned_data_5.csv (38681 dòng) với cấu trúc như sau:
+filepath,patient_name,birth_year,xray_type,datetime
+../XQUANG\20240226\20240226013\20240226013_20240226084723.jpg,MA THI NGUYET,1973.0,SPINE AP,2024-02-26 08:47:23
+...
+Đây là file sau khi clean và cứu lại những dòng data bị miss, sau đó tui copy ra thành file cleaned_data_final_draft.csv và bỏ vào folder CleaningData/final để làm sạch lần nữa. Chạy qua 1 file code notebook CleaningData/final/clean_draft_final_data.ipnb để phân loại data bị noisy như sau:
+# %%
+import pandas as pd
+
+df_draft = pd.read_csv('cleaned_data_final_draft.csv')
+df_draft.head()
+
+# %%
+import matplotlib.pyplot as plt
+
+# Clusterd data by 'xray_type' column and show chart counts
+grouped = df_draft.groupby('xray_type')
+grouped.size().plot(kind='barh', title='Counts of X-ray Types')
+plt.xlabel('Count')
+plt.ylabel('X-ray Type')
+plt.show()
+
+# %%
+# List all xray types in the dataset with counts
+xray_counts = df_draft['xray_type'].value_counts()
+for xray_type, count in xray_counts.items():
+    print(f"{xray_type}: {count}")
+
+# %%
+# Remove space characters from 'xray_type' column
+df_draft['xray_type'] = df_draft['xray_type'].str.replace(' ', '')
+
+xray_counts = df_draft['xray_type'].value_counts()
+for xray_type, count in xray_counts.items():
+    print(f"{xray_type}: {count}")
+
+# %%
+import pandas as pd
+import re
+
+# 1. Định nghĩa từ điển Mapping cho bộ phận cơ thể (X-Ray)
+# Key là nhãn CHUẨN, Value là danh sách các từ khóa tìm kiếm (bao gồm cả lỗi OCR phổ biến)
+XRAY_MAPPING = {
+    'CHEST': ['CHEST', 'THORAX', 'LUNG', 'RIB', 'CLAVICLE', 'HEST', 'CNEST', 'PHOI'],
+    'SKULL': ['SKULL', 'HEAD', 'SINUS', 'MANDIBLE', 'ZYGOMA', 'NASAL', 'FACE', 'SO', 'HAM'],
+    'SPINE': ['SPINE', 'CERVICAL', 'LUMBAR', 'THORACIC', 'SACRUM', 'COCCYX', 'NECK', 'COT SONG', 'L-SPINE', 'C-SPINE', 'T-SPINE'],
+    'ABDOMEN': ['ABDOMEN', 'ABD', 'KUB', 'BUNG'],
+    'PELVIS': ['PELVIS', 'HIP', 'SI JOINT', 'CHAU'],
+    'KNEE': ['KNEE', 'PATELLA', 'GOI'],
+    'SHOULDER': ['SHOULDER', 'SCAPULA', 'VAI'],
+    'HAND': ['HAND', 'FINGER', 'THUMB', 'DIGIT', 'BAN TAY', 'NGON TAY'],
+    'WRIST': ['WRIST', 'CARPAL', 'CO TAY'],
+    'ELBOW': ['ELBOW', 'KHUYU'],
+    'FOREARM': ['FOREARM', 'RADIUS', 'ULNA', 'CANG TAY'],
+    'FOOT': ['FOOT', 'TOE', 'HEEL', 'CALCANEUS', 'BAN CHAN'],
+    'ANKLE': ['ANKLE', 'CO CHAN'],
+    'HUMERUS': ['HUMERUS', 'ARM', 'CANH TAY'],
+    'FEMUR': ['FEMUR', 'THIGH', 'DUI'],
+    'LEG': ['LEG', 'TIBIA', 'FIBULA', 'CANG CHAN']
+}
+
+# 2. Định nghĩa từ khóa nhận diện tên người Việt (Các Họ phổ biến)
+VN_SURNAMES = [
+    'NGUYEN', 'TRAN', 'LE', 'PHAM', 'HOANG', 'HUYNH', 'PHAN', 'VU', 'VO', 'DANG', 
+    'BUI', 'DO', 'HO', 'NGO', 'DUONG', 'LY', 'TRINH', 'DINH', 'LAM', 'MAI', 
+    'LUONG', 'TRUONG', 'THAI', 'CAO', 'CHAU', 'TA', 'PHUNG', 'KHUONG', 'QUACH', 
+    'LA', 'TON', 'DIEP', 'KIEU', 'DAM', 'SON', 'CHU', 'THI', 'VAN'
+]
+
+# 3. Định nghĩa từ khóa nhận diện nhiễu địa chỉ (Đức Trọng)
+# Bao gồm các biến thể lỗi OCR thường gặp
+LOCATION_NOISE = [
+    'TTYT', 'HUYEN', 'DUC', 'TRONG', 'YTE', 'HUTEN', 'DUG', 'RONG', 'LAM', 'DONG', 
+    'CENTER', 'HOSPITAL', 'TYTHUYEN', 'TEHUYEN', 'LHUYEN', 'UHUYEN'
+]
+
+def normalize_and_classify(label):
+    """
+    Hàm chuẩn hóa và phân loại nhãn.
+    Trả về (Category, Normalized_Label)
+    """
+    if not isinstance(label, str):
+        return "OTHERS", str(label)
+    
+    original_label = label
+    label = label.upper().strip()
+    
+    # BƯỚC 1: Xử lý loại ảnh X-Ray (Ưu tiên cao nhất)
+    # Nếu nhãn chứa từ khóa bộ phận cơ thể -> Gán về loại chuẩn
+    for standard_label, keywords in XRAY_MAPPING.items():
+        for kw in keywords:
+            if kw in label:
+                return "XRAY_LABELS", standard_label
+    
+    # BƯỚC 2: Xử lý Tên người Việt
+    # Nếu bắt đầu bằng Họ phổ biến -> Gán vào nhóm tên
+    # Lưu ý: Cần kiểm tra kỹ để tránh nhầm với địa chỉ (ví dụ NGUYEN DUC TRONG có thể là tên hoặc địa chỉ lỗi)
+    # Tuy nhiên trong tập dữ liệu này, TTYT thường viết dính liền hoặc sai chính tả.
+    for surname in VN_SURNAMES:
+        if label.startswith(surname):
+            # Kiểm tra ngoại lệ: Nếu tên người lại chứa từ khóa Đức Trọng quá rõ ràng phía sau
+            if "HUYENDUC" in label or "TTY" in label:
+                return "LOCATION_NOISE", original_label
+            return "VIETNAMESE_NAMES", original_label
+
+    # BƯỚC 3: Xử lý Nhiễu địa chỉ (TTYTHUYENDUCTRONG)
+    # Kiểm tra các biến thể của từ TTYT, HUYEN, DUC, TRONG
+    count_matches = sum(1 for kw in LOCATION_NOISE if kw in label)
+    if count_matches >= 1: # Nếu chứa từ khóa địa chỉ
+        # Regex kiểm tra các mẫu như TTY..., HUYEN...
+        if re.search(r'(TTY|HUT|HUY|DUC|TRONG|YTE)', label):
+            return "LOCATION_NOISE", original_label
+            
+    # BƯỚC 4: Các trường hợp còn lại
+    return "OTHERS", original_label
+
+# --- PHẦN CHẠY CHÍNH ---
+
+# 1. Load dữ liệu (Thay 'dataset.csv' bằng đường dẫn file thực tế của bạn)
+# Nếu bạn chưa có file csv mà chỉ có list, bạn có thể tạo DataFrame từ list đó.
+# Ở đây tôi ví dụ load từ file csv có cột 'raw_label'
+try:
+    df = pd.read_csv('cleaned_data_final_draft.csv')
+except FileNotFoundError:
+    # TẠO DỮ LIỆU GIẢ LẬP ĐỂ TEST (Dựa trên input của bạn)
+    print("Không tìm thấy file dataset.csv, đang tạo dữ liệu mẫu để demo...")
+    data_sample = {
+        'raw_label': [
+            'CHESTPA', 'SKULLAP', 'SPINEAP', 'NGUYEN', 'HUYENDUC', 'FOREARM', 
+            'TTYTHUYENDUCTRONG', 'TRAN', 'ELBOW', 'PHAM', 'HUYENDUG', 'TEST', 
+            'SKULL', 'CHEST', 'LSPINEAP', 'NGUYENTHI', 'ANKLE', 'FOOT',
+            'TTYTEHUYENDUC', 'WRIST', 'PELVISAP', 'KNEE', 'DUCTRONG'
+        ]
+    }
+    df = pd.DataFrame(data_sample)
+
+# 2. Áp dụng hàm phân loại
+df[['Category', 'Clean_Label']] = df['xray_type'].apply(
+    lambda x: pd.Series(normalize_and_classify(x))
+)
+
+# 3. Thống kê kết quả
+print("\n--- THỐNG KÊ SAU KHI PHÂN LOẠI ---")
+print(df['Category'].value_counts())
+
+# 4. Xuất ra 4 file CSV riêng biệt
+output_files = {
+    "XRAY_LABELS": "dataset_chuan_xray.csv",
+    "LOCATION_NOISE": "dataset_rac_ttythuyenductrong.csv",
+    "VIETNAMESE_NAMES": "dataset_ten_nguoi_viet.csv",
+    "OTHERS": "dataset_con_lai.csv"
+}
+
+for category, filename in output_files.items():
+    # Lọc dữ liệu theo nhóm
+    subset = df[df['Category'] == category].copy()
+    
+    # Chỉ giữ lại cột Clean_Label cho file XRAY (để dùng luôn), các file rác giữ nguyên label gốc để check
+    if category == "XRAY_LABELS":
+        final_df = subset[['xray_type', 'Clean_Label']]
+    else:
+        final_df = subset[['xray_type']]
+        
+    final_df.to_csv(filename, index=False)
+    print(f"Đã xuất file: {filename} ({len(subset)} dòng)")
+
+print("\nHoàn tất xử lý!")
+
+# %%
+import pandas as pd
+import re
+
+# --- CẤU HÌNH TỪ KHÓA ---
+
+# 1. Mapping X-Ray (Chuẩn hóa)
+XRAY_MAPPING = {
+    'CHEST': ['CHEST', 'THORAX', 'LUNG', 'RIB', 'CLAVICLE', 'HEST', 'CNEST', 'PHOI', 'GHEST', 'CHESTPA', 'CHESTAP'],
+    'SKULL': ['SKULL', 'HEAD', 'SINUS', 'MANDIBLE', 'ZYGOMA', 'NASAL', 'FACE', 'SO', 'HAM'],
+    'SPINE': ['SPINE', 'CERVICAL', 'LUMBAR', 'THORACIC', 'SACRUM', 'COCCYX', 'NECK', 'COT SONG', 'L-SPINE', 'C-SPINE', 'T-SPINE', 'LSPINE', 'CSPINE'],
+    'ABDOMEN': ['ABDOMEN', 'ABD', 'KUB', 'BUNG'],
+    'PELVIS': ['PELVIS', 'HIP', 'SI JOINT', 'CHAU'],
+    'KNEE': ['KNEE', 'PATELLA', 'GOI'],
+    'SHOULDER': ['SHOULDER', 'SCAPULA', 'VAI'],
+    'HAND': ['HAND', 'FINGER', 'THUMB', 'DIGIT', 'BAN TAY', 'NGON TAY'],
+    'WRIST': ['WRIST', 'CARPAL', 'CO TAY'],
+    'ELBOW': ['ELBOW', 'KHUYU'],
+    'FOREARM': ['FOREARM', 'RADIUS', 'ULNA', 'CANG TAY'],
+    'FOOT': ['FOOT', 'TOE', 'HEEL', 'CALCANEUS', 'BAN CHAN'],
+    'ANKLE': ['ANKLE', 'CO CHAN'],
+    'HUMERUS': ['HUMERUS', 'ARM', 'CANH TAY'],
+    'FEMUR': ['FEMUR', 'THIGH', 'DUI'],
+    'LEG': ['LEG', 'TIBIA', 'FIBULA', 'CANG CHAN']
+}
+
+# 2. Nhận diện Tên người Việt (Họ phổ biến)
+VN_SURNAMES = [
+    'NGUYEN', 'TRAN', 'LE', 'PHAM', 'HOANG', 'HUYNH', 'PHAN', 'VU', 'VO', 'DANG', 
+    'BUI', 'DO', 'HO', 'NGO', 'DUONG', 'LY', 'TRINH', 'DINH', 'LAM', 'MAI', 
+    'LUONG', 'TRUONG', 'THAI', 'CAO', 'CHAU', 'TA', 'PHUNG', 'KHUONG', 'QUACH', 
+    'LA', 'TON', 'DIEP', 'KIEU', 'DAM', 'SON', 'CHU', 'THI', 'VAN', 'TIT', 'TIT'
+]
+
+# 3. Nhận diện Rác địa chỉ (TTYTHUYENDUCTRONG và biến thể)
+LOCATION_NOISE = [
+    'TTYT', 'HUYEN', 'DUC', 'TRONG', 'YTE', 'HUTEN', 'DUG', 'RONG', 'LAM', 'DONG', 
+    'CENTER', 'HOSPITAL', 'TYTHUYEN', 'TEHUYEN', 'LHUYEN', 'UHUYEN', 'HUTENDUC'
+]
+
+def analyze_label(label):
+    """
+    Phân tích nhãn để xác định Category và Clean_Label
+    Trả về: (Category, Normalized_Value)
+    """
+    if not isinstance(label, str):
+        return "OTHERS", str(label)
+    
+    label_upper = label.upper().strip()
+    
+    # 1. Kiểm tra X-Ray (Ưu tiên chuẩn hóa)
+    for standard_label, keywords in XRAY_MAPPING.items():
+        for kw in keywords:
+            if kw in label_upper:
+                return "XRAY_LABELS", standard_label
+    
+    # 2. Kiểm tra Địa chỉ/Rác OCR (TTYTHUYENDUCTRONG)
+    # Check regex trước cho các biến thể dính chùm
+    if re.search(r'(TTY|HUT|HUY|DUC|TRONG|YTE|HUYEN)', label_upper):
+        return "LOCATION_NOISE", label # Giữ nguyên nhãn gốc vì là rác
+        
+    count_matches = sum(1 for kw in LOCATION_NOISE if kw in label_upper)
+    if count_matches >= 1:
+        return "LOCATION_NOISE", label
+
+    # 3. Kiểm tra Tên người Việt
+    for surname in VN_SURNAMES:
+        if label_upper.startswith(surname):
+            return "VIETNAMESE_NAMES", label
+
+    # 4. Còn lại
+    return "OTHERS", label
+
+# --- XỬ LÝ CHÍNH ---
+
+def process_dataset(input_file):
+    try:
+        # Load dữ liệu
+        df = pd.read_csv(input_file)
+        print(f"Đã đọc file {input_file} với {len(df)} dòng.")
+        
+        # Kiểm tra cột xray_type có tồn tại không
+        if 'xray_type' not in df.columns:
+            print("Lỗi: Không tìm thấy cột 'xray_type' trong file CSV.")
+            return
+
+        # 1. Phân tích và tạo cột tạm để lưu kết quả phân loại
+        # Hàm analyze_label trả về (Category, New_Label)
+        analysis_result = df['xray_type'].apply(lambda x: analyze_label(x))
+        
+        # Tách kết quả thành 2 cột riêng
+        df['Temp_Category'] = [res[0] for res in analysis_result]
+        df['Temp_Clean_Label'] = [res[1] for res in analysis_result]
+
+        # 2. Thay thế giá trị trong cột xray_type CHỈ KHI nó là nhãn X-Ray chuẩn
+        # Các trường hợp rác (Tên, Địa chỉ) giữ nguyên giá trị gốc trong cột xray_type
+        mask_valid = df['Temp_Category'] == 'XRAY_LABELS'
+        df.loc[mask_valid, 'xray_type'] = df.loc[mask_valid, 'Temp_Clean_Label']
+
+        # 3. Xuất file theo từng nhóm
+        output_files = {
+            "XRAY_LABELS": "dataset_xray_original.csv",
+            "LOCATION_NOISE": "dataset_noisy_address.csv",
+            "VIETNAMESE_NAMES": "dataset_noisy_name.csv",
+            "OTHERS": "dataset_noisy_other.csv"
+        }
+
+        # Danh sách các cột gốc cần giữ lại
+        original_columns = ['filepath', 'patient_name', 'birth_year', 'xray_type', 'datetime']
+        
+        # Đảm bảo chỉ lấy các cột có thực tế trong file (phòng trường hợp file thiếu cột nào đó)
+        valid_columns = [col for col in original_columns if col in df.columns]
+
+        print("\n--- BẮT ĐẦU XUẤT FILE ---")
+        for category, filename in output_files.items():
+            # Lọc dữ liệu theo Category
+            subset = df[df['Temp_Category'] == category].copy()
+            
+            # Chỉ lấy các cột gốc ban đầu (xray_type đã được chuẩn hóa nếu là XRAY)
+            final_subset = subset[valid_columns]
+            
+            # Xuất file
+            final_subset.to_csv(filename, index=False)
+            print(f"-> Đã xuất: {filename} - Số lượng: {len(subset)}")
+            
+            if category == "XRAY_LABELS":
+                print(f"   (Ghi chú: Cột xray_type trong file này đã được chuẩn hóa)")
+            else:
+                print(f"   (Ghi chú: Cột xray_type giữ nguyên gốc để kiểm tra)")
+
+        print("\nHoàn tất xử lý!")
+
+    except FileNotFoundError:
+        print("Không tìm thấy file input. Đang tạo dữ liệu mẫu để test logic...")
+        create_mock_data_and_test()
+
+def create_mock_data_and_test():
+    # Tạo dữ liệu giả lập để test nếu không có file thật
+    data = {
+        'filepath': ['/img/1.jpg', '/img/2.jpg', '/img/3.jpg', '/img/4.jpg', '/img/5.jpg'],
+        'patient_name': ['A', 'B', 'C', 'D', 'E'],
+        'birth_year': [1990, 1991, 1992, 1993, 1994],
+        'xray_type': ['CHESTPA', 'NGUYEN', 'TTYTHUYENDUCTRONG', 'SKULLAP', 'TEST_DATA'],
+        'datetime': ['2023-01-01', '2023-01-02', '2023-01-03', '2023-01-04', '2023-01-05']
+    }
+    df_mock = pd.DataFrame(data)
+    df_mock.to_csv('dataset_mock.csv', index=False)
+    process_dataset('dataset_mock.csv')
+
+
+process_dataset('cleaned_data_final_draft.csv')
+
+
+Sau khi chạy file code này thì cho ra kết quả những file như sau:
+Đã đọc file cleaned_data_final_draft.csv với 38680 dòng.
+
+--- BẮT ĐẦU XUẤT FILE ---
+-> Đã xuất: dataset_xray_original.csv - Số lượng: 26956
+   (Ghi chú: Cột xray_type trong file này đã được chuẩn hóa)
+-> Đã xuất: dataset_noisy_address.csv - Số lượng: 3074
+   (Ghi chú: Cột xray_type giữ nguyên gốc để kiểm tra)
+-> Đã xuất: dataset_noisy_name.csv - Số lượng: 4801
+   (Ghi chú: Cột xray_type giữ nguyên gốc để kiểm tra)
+-> Đã xuất: dataset_noisy_other.csv - Số lượng: 3849
+   (Ghi chú: Cột xray_type giữ nguyên gốc để kiểm tra)
+
+Sau đó tui copy toàn bộ 4 file này vào folder CleaningData/clean_analyze_and_nomorlize để khử noisy cho tập data bằng code notebook CleaningData/clean_analyze_and_nomorlize/clean_analyze_nomorlize.ipynb:
+# %%
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# %% [markdown]
+# # 1. X-RAY ORIGINAL ANALYZE
+
+# %%
+df_original = pd.read_csv('dataset_xray_original.csv')
+
+grouped = df_original.groupby('xray_type')
+grouped.size().plot(kind='barh', title='Counts of X-ray Types')
+plt.xlabel('Count')
+plt.ylabel('X-ray Type')
+plt.show()
+
+# %%
+xray_counts = df_original['xray_type'].value_counts()
+for xray_type, count in xray_counts.items():
+    print(f"{xray_type}: {count}")
+
+# %% [markdown]
+# ---
+
+# %% [markdown]
+# # 2. Save data noisy address
+
+# %%
+df_noise_address = pd.read_csv('dataset_noisy_address.csv')
+
+# %%
+import cv2
+import easyocr
+reader = easyocr.Reader(['en'])
+for i in range(len(df_noise_address)):
+    img_path = df_noise_address.iloc[i]['filepath']
+    img = cv2.imread("../../" + img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = gray[0:500, 0:1000]
+    results = reader.readtext(gray)
+    patient_name = str(results[2][1])
+    birth_year = ''
+    if patient_name.split()[-1].isnumeric():
+        birth_year = patient_name.split()[-1]
+    x_ray_type = str(results[3][1])
+    df_noise_address.at[i, 'patient_name'] = patient_name
+    df_noise_address.at[i, 'birth_year'] = birth_year
+    df_noise_address.at[i, 'xray_type'] = x_ray_type
+    print(f"{i + 1}: Extracted patient_name: {patient_name} - birthday: {birth_year} - x-ray type: {x_ray_type} - from image: {img_path}")
+
+df_noise_address.to_csv('dataset_noisy_address.csv', index=False)
+
+# %%
+df_noise_address = pd.read_csv('dataset_noisy_address.csv')
+df_noise_address['patient_name'] = df_noise_address['patient_name'].str.replace(r'[^a-zA-Z\s]', '', regex=True).str.upper()
+df_noise_address.head()
+df_noise_address.to_csv('dataset_noisy_address.csv', index=False)
+
+# %%
+import labled
+from importlib import reload
+reload(labled)
+
+# %%
+labled.process_dataset(
+    'dataset_noisy_address.csv',
+    output_files = {
+        "XRAY_LABELS": "address/dataset_xray_original.csv",
+        "LOCATION_NOISE": "address/dataset_noisy_address.csv",
+        "VIETNAMESE_NAMES": "address/dataset_noisy_name.csv",
+        "OTHERS": "address/dataset_noisy_other.csv"
+    }
+)
+
+# %% [markdown]
+# ---
+
+# %% [markdown]
+# # 3. Save data noisy name
+
+# %%
+df_noise_name = pd.read_csv('dataset_noisy_name.csv')
+
+# %%
+import cv2
+import easyocr
+reader = easyocr.Reader(['en'])
+for i in range(len(df_noise_name)):
+    img_path = df_noise_name.iloc[i]['filepath']
+    img = cv2.imread("../../" + img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = gray[0:500, 0:1000]
+    results = reader.readtext(gray)
+    patient_name = str(results[2][1])
+    birth_year = ''
+    if patient_name.split()[-1].isnumeric():
+        birth_year = patient_name.split()[-1]
+    x_ray_type = str(results[3][1])
+    #df_noise_name.at[i, 'patient_name'] = patient_name
+    #df_noise_name.at[i, 'birth_year'] = birth_year
+    df_noise_name.at[i, 'xray_type'] = x_ray_type
+    print(f"{i + 1}: Extracted patient_name: {patient_name} - birthday: {birth_year} - x-ray type: {x_ray_type} - from image: {img_path}")
+
+df_noise_name.to_csv('dataset_noisy_name.csv', index=False)
+
+# %%
+df_noise_name = pd.read_csv('dataset_noisy_name.csv')
+df_noise_name['patient_name'] = df_noise_name['patient_name'].str.replace(r'[^a-zA-Z\s]', '', regex=True).str.upper()
+df_noise_name.head()
+df_noise_name.to_csv('dataset_noisy_address.csv', index=False)
+
+# %%
+labled.process_dataset(
+    'dataset_noisy_name.csv',
+    output_files = {
+        "XRAY_LABELS": "name/dataset_xray_original.csv",
+        "LOCATION_NOISE": "name/dataset_noisy_address.csv",
+        "VIETNAMESE_NAMES": "name/dataset_noisy_name.csv",
+        "OTHERS": "name/dataset_noisy_other.csv"
+    }
+)
+
+# %% [markdown]
+# ---
+
+# %% [markdown]
+# # 4. Save data noisy other
+
+# %%
+df_noise_other = pd.read_csv('dataset_noisy_other.csv')
+
+# %%
+import cv2
+import easyocr
+reader = easyocr.Reader(['en'])
+for i in range(len(df_noise_other)):
+    img_path = df_noise_other.iloc[i]['filepath']
+    img = cv2.imread("../../" + img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = gray[0:500, 0:1000]
+    results = reader.readtext(gray)
+    patient_name = str(results[2][1])
+    birth_year = ''
+    if patient_name.split()[-1].isnumeric():
+        birth_year = patient_name.split()[-1]
+    x_ray_type = str(results[3][1])
+    #df_noise_name.at[i, 'patient_name'] = patient_name
+    #df_noise_name.at[i, 'birth_year'] = birth_year
+    df_noise_other.at[i, 'xray_type'] = x_ray_type
+    print(f"{i + 1}: Extracted patient_name: {patient_name} - birthday: {birth_year} - x-ray type: {x_ray_type} - from image: {img_path}")
+
+df_noise_other.to_csv('dataset_noisy_other.csv', index=False)
+
+# %%
+df_noise_other = pd.read_csv('dataset_noisy_other.csv')
+df_noise_other['patient_name'] = df_noise_other['patient_name'].str.replace(r'[^a-zA-Z\s]', '', regex=True).str.upper()
+df_noise_other.head()
+df_noise_other.to_csv('dataset_noisy_other.csv', index=False)
+
+# %%
+labled.process_dataset(
+    'dataset_noisy_other.csv',
+    output_files = {
+        "XRAY_LABELS": "other/dataset_xray_original.csv",
+        "LOCATION_NOISE": "other/dataset_noisy_address.csv",
+        "VIETNAMESE_NAMES": "other/dataset_noisy_name.csv",
+        "OTHERS": "other/dataset_noisy_other.csv"
+    }
+)
+
+# %% [markdown]
+# ---
+
+# %% [markdown]
+# # 5. Merge file
+
+# %%
+df_original = pd.read_csv('dataset_xray_original.csv')
+df_address_original = pd.read_csv('address/dataset_xray_original.csv')
+df_name_original = pd.read_csv('name/dataset_xray_original.csv')
+df_other_original = pd.read_csv('other/dataset_xray_original.csv')
+
+combined = pd.concat([df_original, df_address_original, df_name_original, df_other_original]).drop_duplicates().reset_index(drop=True)
+combined.to_csv('dataset_xray_original_combined.csv', index=False)
+
+# %%
+# Check duplicates 'filepath' column
+duplicates = combined[combined.duplicated(subset=['filepath'], keep=False)]
+print(f"Number of duplicate filepaths: {len(duplicates)}")
+print(len(combined))
+
+# %%
+grouped = combined.groupby('xray_type')
+grouped.size().plot(kind='barh', title='Counts of X-ray Types')
+plt.xlabel('Count')
+plt.ylabel('X-ray Type')
+plt.show()
+
+# %%
+xray_counts = combined['xray_type'].value_counts()
+for xray_type, count in xray_counts.items():
+    print(f"{xray_type}: {count}")
+
+
+Kết quả khử noisy này là file dataset_xray_original_combined.csv (38487 dòng) và đây là kết quả cuối cùng của bước clean data của tui. File này có cấu trúc như sau:
+filepath,patient_name,birth_year,xray_type,datetime
+../XQUANG\20240226\20240226013\20240226013_20240226084723.jpg,MA THI NGUYET,1973.0,SPINE,2024-02-26 08:47:23
+...
+Và file này sẽ được dùng cho bước tiếp theo là matching data.
+
+Bước 3: Phân tích và match dữ liệu (Folder AnalyzeData):
+Trước khi vào bước này tui đã export file excel kết quả ban đầu của bệnh viện thành file ketqua.csv (28670 dòng) với cấu trúc như sau:
+STT,ID,Name,,Female,Male,Address,,Insurance,Diagnose,,Department,Require,,Film numbers,,Doctor,,,Technician,,Date assign,,Date start,Date end,,Result
+1,2400141999,PHAN THỊ DẬU,,72 tuổi,,"Thị trấn Liên Nghĩa, Huyện Đức Trọng, Lâm Đồng",,X,M13.9-Viêm khớp không đặc hiệu; M79.1-Đau cơ,,Khoa Khám Bệnh,"Chụp Xquang khớp khuỷu thẳng, nghiêng hoặc chếch",,2,,Liêng Hót Ha Duyel,,,Trần Ngọc Tiến,,01/08/2024 09:09,,01/08/2024 09:38,01/08/2024 09:41,,- XƯƠNG VÙNG KHUỶU TAY (T) BÌNH THƯỜNG .
+...
+
+và kết hợp với file dataset_xray_original_combined.csv (38487 dòng) từ bước 2 để tiến hành match data.
+
+2 file này sẽ đi qua code AnalyzeData/match_data_4.py như sau:
+import pandas as pd
+import unicodedata
+from difflib import SequenceMatcher
+from datetime import timedelta
+
+# 1. Load dữ liệu
+df_xray = pd.read_csv('AnalyzeData/dataset_xray_original_combined.csv')
+df_ketqua = pd.read_csv('AnalyzeData/ketqua.csv')
+
+# --- PRE-PROCESSING ---
+
+def normalize_text(text):
+    if pd.isna(text): return ""
+    text = str(text).upper()
+    text = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
+    return text.strip()
+
+# Chuẩn hóa tên
+df_xray['norm_name'] = df_xray['patient_name'].apply(normalize_text)
+df_ketqua['norm_name'] = df_ketqua['Name'].apply(normalize_text)
+
+# Xử lý thời gian
+df_xray['datetime_obj'] = pd.to_datetime(df_xray['datetime'], errors='coerce')
+# Tạo cột Date (chỉ ngày) để khoanh vùng
+df_xray['date_only'] = df_xray['datetime_obj'].dt.date
+
+df_ketqua['date_start_obj'] = pd.to_datetime(df_ketqua['Date start'], format='%d/%m/%Y %H:%M', errors='coerce')
+df_ketqua['date_only'] = df_ketqua['date_start_obj'].dt.date
+
+# Xử lý Năm sinh cho file Ketqua (Trích xuất từ cột Female/Male)
+# Logic: Lấy cột Female nếu có, không thì lấy Male, bỏ chữ " tuổi" và ép kiểu số
+def extract_age_to_year(row):
+    age_str = row['Female'] if pd.notna(row['Female']) else row['Male']
+    if pd.isna(age_str): return None
+    try:
+        age = int(str(age_str).replace(' tuổi', '').strip())
+        # Giả sử dữ liệu năm 2024/2025, ta lấy năm hiện tại của record đó trừ đi tuổi
+        # Hoặc đơn giản lấy 2024 - tuổi (cần linh hoạt chỗ này)
+        current_year = row['date_start_obj'].year if pd.notna(row['date_start_obj']) else 2024
+        return current_year - age
+    except:
+        return None
+
+df_ketqua['calc_birth_year'] = df_ketqua.apply(extract_age_to_year, axis=1)
+
+# --- MATCHING ENGINE ---
+
+def find_best_match(row_xray, df_lookup):
+    """
+    Hàm tìm kiếm thông minh:
+    1. Filter theo ngày (+/- 0 ngày).
+    2. Tính điểm tương đồng tên.
+    3. Cộng điểm nếu trùng năm sinh.
+    """
+    if pd.isna(row_xray['date_only']):
+        return None, 0, "No Date"
+
+    # 1. BLOCKING: Chỉ lấy danh sách khám trong cùng ngày
+    # (Có thể mở rộng +/- 1 ngày nếu cần, nhưng cùng ngày là chuẩn nhất)
+    candidates = df_lookup[df_lookup['date_only'] == row_xray['date_only']].copy()
+    
+    if candidates.empty:
+        return None, 0, "Date Mismatch"
+
+    best_score = 0
+    best_candidate_idx = None
+    
+    xray_name = row_xray['norm_name']
+    xray_year = row_xray['birth_year']
+
+    # Duyệt qua các ứng viên trong ngày đó
+    for idx, cand in candidates.iterrows():
+        cand_name = cand['norm_name']
+        
+        # 2. FUZZY NAME MATCHING
+        # SequenceMatcher trả về ratio 0.0 -> 1.0
+        name_score = SequenceMatcher(None, xray_name, cand_name).ratio()
+        
+        # 3. BOOST SCORE NẾU TRÙNG NĂM SINH
+        # Nếu năm sinh khớp nhau (hoặc lệch 1 năm do cách tính tuổi), cộng thêm điểm tự tin
+        cand_year = cand['calc_birth_year']
+        if pd.notna(xray_year) and pd.notna(cand_year):
+            if abs(xray_year - cand_year) <= 1:
+                name_score += 0.2 # Boost 20% nếu trùng năm sinh
+            elif abs(xray_year - cand_year) > 5:
+                name_score -= 0.3 # Trừ điểm nặng nếu năm sinh lệch quá xa (khác người)
+
+        if name_score > best_score:
+            best_score = name_score
+            best_candidate_idx = idx
+
+    # Ngưỡng chấp nhận (Threshold)
+    # Nếu điểm > 0.6 (60%) thì coi là match. Nếu có trùng năm sinh thì điểm thường > 1.0
+    if best_score > 0.6: 
+        return best_candidate_idx, best_score, "Matched"
+    else:
+        return None, best_score, "Low Score"
+
+# --- RUNNING THE MATCH ---
+# Tạo list kết quả để convert thành DataFrame cho nhanh
+results = []
+
+print("Đang xử lý matching... vui lòng đợi...")
+total_rows = len(df_xray)
+
+for i, row in df_xray.iterrows():
+    if i % 1000 == 0: print(f"Processing row {i}/{total_rows}")
+    
+    match_idx, score, status = find_best_match(row, df_ketqua)
+    
+    res = {
+        'xray_index': i,
+        'match_score': score,
+        'match_status': status
+    }
+    
+    if match_idx is not None:
+        # Lấy thông tin từ dòng match được
+        match_data = df_ketqua.loc[match_idx].to_dict()
+        # Prefix 'ketqua_' để phân biệt
+        for k, v in match_data.items():
+            res[f'ketqua_{k}'] = v
+    
+    results.append(res)
+
+# Tạo DataFrame kết quả
+df_results = pd.DataFrame(results)
+
+# Ghép lại với file gốc
+df_final = df_xray.join(df_results.set_index('xray_index'))
+
+# --- THỐNG KÊ ---
+matched_count = df_final[df_final['match_status'] == 'Matched'].shape[0]
+print(f"\nTotal Records: {total_rows}")
+print(f"Matched: {matched_count}")
+print(f"Match Rate: {(matched_count/total_rows)*100:.2f}%")
+
+# Lưu file
+# Bỏ bớt các cột tính toán phụ nếu cần
+df_final.to_csv('AnalyzeData/result4/merged_xray_smart_match.csv', index=False)
+print("File saved: merged_xray_smart_match.csv")
+
+Chạy xong kết quả lưu trong folder AnalyzeData/result4 và sau đó chạy qua code notebook AnalyzeData/match_data.ipynb để cứu data bị miss match:
+# %%
+import pandas as pd
+from difflib import SequenceMatcher
+from datetime import timedelta
+
+# 1. Load file kết quả vừa chạy xong (để xử lý tiếp các ca Miss)
+# Lưu ý: Sửa tên file nếu bro lưu khác
+df_current = pd.read_csv('result4/merged_xray_smart_match.csv') 
+df_ketqua = pd.read_csv('ketqua.csv')
+
+print(f"Tổng số record: {len(df_current)}")
+print(f"Số record đã match: {len(df_current[df_current['match_status'] == 'Matched'])}")
+print(f"Số record cần giải cứu (Miss): {len(df_current[df_current['match_status'] != 'Matched'])}")
+
+# --- CHUẨN BỊ DỮ LIỆU ---
+# Cần convert lại datetime vì khi save/load CSV nó về dạng string
+df_current['datetime_obj'] = pd.to_datetime(df_current['datetime'], errors='coerce')
+df_current['date_only'] = df_current['datetime_obj'].dt.date
+
+df_ketqua['date_start_obj'] = pd.to_datetime(df_ketqua['Date start'], format='%d/%m/%Y %H:%M', errors='coerce')
+df_ketqua['date_only'] = df_ketqua['date_start_obj'].dt.date
+
+# Hàm chuẩn hóa (dùng lại logic cũ)
+import unicodedata
+def normalize_text(text):
+    if pd.isna(text): return ""
+    text = str(text).upper()
+    text = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
+    return text.strip()
+
+df_ketqua['norm_name'] = df_ketqua['Name'].apply(normalize_text)
+# df_current đã có cột norm_name từ lần chạy trước, không cần làm lại
+
+# --- HÀM TÌM KIẾM MỞ RỘNG (RESCUE) ---
+def find_rescue_match(row_xray, df_lookup):
+    if pd.isna(row_xray['date_only']):
+        return None, 0, "No Date"
+
+    xray_date = row_xray['date_only']
+    xray_name = str(row_xray['norm_name'])
+    
+    # CHIẾN LƯỢC 2: Mở rộng +/- 3 ngày
+    start_window = xray_date - timedelta(days=3)
+    end_window = xray_date + timedelta(days=3)
+    
+    # Lọc ứng viên trong 7 ngày (3 trước, 3 sau, 1 hiện tại)
+    candidates = df_lookup[
+        (df_lookup['date_only'] >= start_window) & 
+        (df_lookup['date_only'] <= end_window)
+    ]
+    
+    if candidates.empty:
+        return None, 0, "No Candidates (+/-3 days)"
+
+    best_score = 0
+    best_idx = None
+
+    for idx, cand in candidates.iterrows():
+        cand_name = cand['norm_name']
+        score = SequenceMatcher(None, xray_name, cand_name).ratio()
+        
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    
+    # Threshold: Vì đã mở rộng ngày (rủi ro cao hơn), ta cần tên phải giống tương đối
+    # Giữ mức 0.65 hoặc 0.7 để tránh match nhầm người khác trong mấy ngày đó
+    if best_score > 0.65:
+        return best_idx, best_score, "Matched (Rescue +/-3d)"
+    else:
+        return None, best_score, "Low Score Rescue"
+
+# --- CHẠY VÒNG GIẢI CỨU ---
+print("\nĐang chạy vòng giải cứu (Rescue Phase)...")
+
+# Chỉ iter qua những dòng chưa match
+mask_miss = df_current['match_status'] != 'Matched'
+indices_to_rescue = df_current[mask_miss].index
+
+count = 0
+rescued_count = 0
+
+for i in indices_to_rescue:
+    row = df_current.loc[i]
+    
+    match_idx, score, status = find_rescue_match(row, df_ketqua)
+    
+    if match_idx is not None:
+        # Cập nhật trực tiếp vào DataFrame gốc
+        df_current.at[i, 'match_score'] = score
+        df_current.at[i, 'match_status'] = status
+        
+        # Lấy data từ ketqua đắp vào
+        match_data = df_ketqua.loc[match_idx]
+        for col in df_ketqua.columns:
+            # Chỉ lấy các cột data gốc của ketqua (tránh mấy cột temp)
+            if col not in ['norm_name', 'date_start_obj', 'date_only', 'calc_birth_year']:
+                target_col = f"ketqua_{col}"
+                # Nếu cột chưa tồn tại trong df_current thì tạo mới (ít xảy ra vì đã có từ pass 1)
+                df_current.at[i, target_col] = match_data[col]
+        
+        rescued_count += 1
+    
+    count += 1
+    if count % 500 == 0:
+        print(f"Đã duyệt {count} ca miss...")
+
+# --- KẾT QUẢ CUỐI CÙNG ---
+final_matched = len(df_current[df_current['match_status'].str.contains('Matched')])
+final_rate = (final_matched / len(df_current)) * 100
+
+print("-" * 30)
+print(f"SỐ CA ĐƯỢC CỨU THÊM: {rescued_count}")
+print(f"Tổng số record: {len(df_current)}")
+print(f"Tổng số Match cuối cùng: {final_matched}")
+print(f"Tỷ lệ Match cuối cùng: {final_rate:.2f}%")
+print("-" * 30)
+
+# Lưu file version 2
+df_current.to_csv('result4/merged_xray_final_v2.csv', index=False)
+print("Đã lưu file: merged_xray_final_v2.csv")
+
+# %%
+import pandas as pd
+
+# 1. Load file kết quả cuối cùng (v2)
+df_final = pd.read_csv('result4/merged_xray_final_v2.csv')
+
+# 2. Lọc ra những dòng chưa match (Match status khác 'Matched...')
+# Lưu ý: Status có thể là 'Matched' hoặc 'Matched (Rescue +/-3d)' nên ta lọc những cái KHÔNG chứa chữ 'Matched'
+missed_df = df_final[~df_final['match_status'].str.contains('Matched', na=False)]
+
+# 3. Chọn các cột quan trọng để dễ soi
+cols_to_view = ['filepath', 'patient_name', 'birth_year', 'datetime', 'match_score', 'match_status']
+# Nếu file có nhiều cột, ta chỉ lấy những cột này cho gọn
+missed_view = missed_df[cols_to_view]
+
+# 4. Xuất ra file
+output_miss = 'result4/unmatched_records_review.csv'
+missed_view.to_csv(output_miss, index=False)
+
+print(f"Đã xuất {len(missed_view)} bản ghi chưa match ra file: {output_miss}")
+print("Bạn hãy mở file này lên để kiểm tra. Nếu thấy lỗi OCR (ví dụ tên là '???'), thì đó là lý do không thể match.")
+
+# 5. Xóa các ca chưa match khỏi file kết quả cuối cùng để chỉ giữ lại các ca đã match
+df_matched_only = df_final[df_final['match_status'].str.contains('Matched', na=False)]
+df_matched_only.to_csv('result4/dataset.csv', index=False)
+print("Đã lưu file chỉ chứa các ca đã match")
+
+
+Kết quả cho ra 1 file dataset.csv (36215 dòng) với cấu trúc như sau:
+filepath,patient_name,birth_year,xray_type,datetime,norm_name,datetime_obj,date_only,match_score,match_status,ketqua_STT,ketqua_ID,ketqua_Name,ketqua_Female,ketqua_Male,ketqua_Address,ketqua_Insurance,ketqua_Diagnose,ketqua_Department,ketqua_Require,ketqua_Film numbers,ketqua_Doctor,ketqua_Technician,ketqua_Date assign,ketqua_Date start,ketqua_Date end,ketqua_Result,ketqua_norm_name,ketqua_date_start_obj,ketqua_date_only,ketqua_calc_birth_year
+../XQUANG\20240226\20240226013\20240226013_20240226084723.jpg,MA THI NGUYET,1973.0,SPINE,2024-02-26 08:47:23,MA THI NGUYET,2024-02-26 08:47:23,2024-02-26,1.2,Matched,21527.0,2400034648.0,MÃ THỊ NGUYỆT,51 tuổi,,"Thị trấn Liên Nghĩa, Huyện Đức Trọng, Lâm Đồng",X,M47-thoái hóa cột sống; M13.9-Viêm khớp không đặc hiệu; M17-thoái hóa khớp gối; M79.1-Đau cơ,Khoa Khám Bệnh,Chụp Xquang cột sống cổ thẳng nghiêng,2.0,Vũ Văn Chung,Võ Ngọc Thạch,26/02/2024 08:43,26/02/2024 09:05,26/02/2024 09:06,HÌNH ẢNH THOÁI HÓA XƯƠNG CỘT SỐNG CỔ,MA THI NGUYET,2024-02-26 09:05:00,2024-02-26,1973.0
+...
+
+Đây là file kết quả cuối cùng của bước 3 này. Đến đây là xong những bước khó khăn để ra 1 file dataset rồi bro.
+
+Bước 4: Gán nhãn data (folder LabeledData). Bước này sẽ gán nhãn hình dựa trên kết quả chẩn đoán của bệnh nhân, file dataset.csv sẽ qua code notebook LabeledData/labeled_dataset.ipynb:
+# %%
+import pandas as pd
+import re
+
+# %%
+LABEL_MAPPING = {
+    # --- GROUP 1: NOMALLY ---
+    "NORMAL": [
+        "bình thường", "không thấy hình ảnh bệnh lý", "không thấy tổn thương", 
+        "tim phổi bình thường", "sáng đều", "trong giới hạn", "chưa thấy", "không thấy hình ảnh"
+    ],
+
+    # --- GROUP 2: CHEST ---
+    "PNEUMONIA": ["viêm phổi", "đám mờ", "thâm nhiễm", "nốt mờ", "kính mờ"],
+    "TUBERCULOSIS": ["lao", "xơ", "vôi hóa", "đỉnh phổi"],
+    "PLEURAL_EFFUSION": ["tràn dịch", "tù góc sườn hoành", "mờ góc sườn hoành"],
+    "CARDIOMEGALY": ["tim to", "bóng tim lớn", "chỉ số tim ngực"],
+    "BRONCHITIS": ["viêm phế quản", "dày thành phế quản", "tăng đậm vân phổi", "rốn phổi đậm"],
+
+    # --- GROUP 3: SPINE/BONE ---
+    "FRACTURE": ["gãy", "vỡ", "nứt", "di lệch", "gián đoạn", "đường sáng"],
+    "DEGENERATION": ["thoái hóa", "gai xương", "đặc xương", "hẹp khe khớp", "mỏ xương"],
+    "SCOLIOSIS": ["cong", "vẹo", "trượt đốt sống", "gù"],
+    "SPONDYLOSIS": ["xẹp đốt sống", "biến dạng"],
+    
+    # --- GROUP 4: SKULL/SINUS ---
+    "SINUSITIS": ["viêm xoang", "mờ xoang", "dày niêm mạc xoang"],
+    "SKULL_TRAUMA": ["lún sọ", "bản sọ"]
+}
+
+LABEL_MAPPING_V2 = {
+    # --- GROUP 1: NORMAL ---
+    "NORMAL": [
+        "bình thường", "không thấy hình ảnh bệnh lý", "không thấy tổn thương", 
+        "tim phổi bình thường", "sáng đều", "trong giới hạn", "chưa thấy", 
+        "không có dấu hiệu", "kết quả bình thường", "chưa thấy", "không thấy hình ảnh"
+    ],
+
+    # --- GROUP 2: CHEST ---
+    "PNEUMONIA/INFILTRATION": [
+        "viêm phổi", "đám mờ", "thâm nhiễm", "nốt mờ", "kính mờ", "phế bào", 
+        "tổn thương nhu mô", "đông đặc"
+    ],
+    "TUBERCULOSIS": ["lao", "xơ", "vôi hóa", "đỉnh phổi", "nốt vôi"],
+    "PLEURAL_EFFUSION": ["tràn dịch", "tù góc sườn hoành", "mờ góc sườn hoành", "dày màng phổi"],
+    "CARDIOMEGALY": ["tim to", "bóng tim lớn", "chỉ số tim ngực", "bè ngang"],
+    "BRONCHITIS": ["viêm phế quản", "dày thành phế quản", "tăng đậm vân phổi", "rốn phổi đậm", "nhánh phế quản"],
+    
+    # --- GROUP 3: SPINE/BONE ---
+    "FRACTURE": ["gãy", "vỡ", "nứt", "di lệch", "gián đoạn", "đường sáng", "mất liên tục"],
+    "DEGENERATION": [
+        "thoái hóa", "gai xương", "đặc xương", "hẹp khe khớp", "mỏ xương", 
+        "xơ xương", "biến đổi thoái hóa"
+    ],
+    "SPINAL_ALIGNMENT": ["cong", "vẹo", "trượt đốt sống", "gù", "mất đường cong", "thẳng trục"],
+    "SPONDYLOSIS/DISC": ["xẹp đốt sống", "biến dạng", "thoát vị", "lún", "giảm chiều cao"],
+    
+    # --- GROUP 4: SKULL/SINUS ---
+    "SINUSITIS": ["viêm xoang", "mờ xoang", "dày niêm mạc", "dịch trong xoang", "ngách mũi"],
+    
+    # --- GROUP 5 ---
+    "HARDWARE/SURGERY": ["kết hợp xương", "nẹp vít", "đinh", "dụng cụ", "cố định", "sau mổ", "phẫu thuật"],
+    "SOFT_TISSUE": ["mô mềm", "dị vật", "phù nề", "sưng"]
+}
+
+# %%
+def clean_text(text):
+    if pd.isna(text) or text == "":
+        return ""
+    text = str(text).lower()
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def get_labels(text):
+    if text == "":
+        return ["UNKNOWN"]
+    
+    detected_labels = []
+    
+    for label, keywords in LABEL_MAPPING_V2.items():
+        for kw in keywords:
+            if kw in text:
+                detected_labels.append(label)
+                break
+    
+    if len(detected_labels) > 1 and "NORMAL" in detected_labels:
+        detected_labels.remove("NORMAL")
+        
+    if not detected_labels:
+        return ["OTHER"]
+        
+    return detected_labels
+
+# %%
+df = pd.read_csv('dataset.csv')
+df['clean_result'] = df['ketqua_Result'].apply(clean_text)
+df['Auto_Labels'] = df['clean_result'].apply(get_labels)
+
+for index, row in df.iterrows():
+    print(f"Original Result: {row['ketqua_Result']}")
+    print(f"Cleaned Result: {row['clean_result']}")
+    print(f"Assigned Labels: {row['Auto_Labels']}")
+    print("-" * 40)
+    print("\n")
+
+# %%
+df = pd.read_csv('dataset.csv')
+df['clean_result'] = df['ketqua_Result'].apply(clean_text)
+df['label'] = df['clean_result'].apply(get_labels)
+df.to_csv('labeled_dataset.csv', index=False)
+
+# %%
+import matplotlib.pyplot as plt
+
+labeled = df['label'].value_counts()
+print(labeled)
+
+labeled.plot(kind='bar', figsize=(20, 6))
+
+# %%
+for k, v in labeled.items():
+    print(k, v)
+
+Kết quả cho ra file labeled_dataset.csv với cấu trúc như sau:
+filepath,patient_name,birth_year,xray_type,datetime,norm_name,datetime_obj,date_only,match_score,match_status,ketqua_STT,ketqua_ID,ketqua_Name,ketqua_Female,ketqua_Male,ketqua_Address,ketqua_Insurance,ketqua_Diagnose,ketqua_Department,ketqua_Require,ketqua_Film numbers,ketqua_Doctor,ketqua_Technician,ketqua_Date assign,ketqua_Date start,ketqua_Date end,ketqua_Result,ketqua_norm_name,ketqua_date_start_obj,ketqua_date_only,ketqua_calc_birth_year,clean_result,label
+../XQUANG\20240226\20240226013\20240226013_20240226084723.jpg,MA THI NGUYET,1973.0,SPINE,2024-02-26 08:47:23,MA THI NGUYET,2024-02-26 08:47:23,2024-02-26,1.2,Matched,21527.0,2400034648.0,MÃ THỊ NGUYỆT,51 tuổi,,"Thị trấn Liên Nghĩa, Huyện Đức Trọng, Lâm Đồng",X,M47-thoái hóa cột sống; M13.9-Viêm khớp không đặc hiệu; M17-thoái hóa khớp gối; M79.1-Đau cơ,Khoa Khám Bệnh,Chụp Xquang cột sống cổ thẳng nghiêng,2.0,Vũ Văn Chung,Võ Ngọc Thạch,26/02/2024 08:43,26/02/2024 09:05,26/02/2024 09:06,HÌNH ẢNH THOÁI HÓA XƯƠNG CỘT SỐNG CỔ,MA THI NGUYET,2024-02-26 09:05:00,2024-02-26,1973.0,hình ảnh thoái hóa xương cột sống cổ,['DEGENERATION']
+...
+
+Bước 5: Chia dataset (folder SplitDataset). Bước này sẽ chia tập labeled_dataset thành 3 bộ data (train, test và val) bằng code notebook SplitDataset/split_dataset.ipynb:
+# %%
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+import ast
+import json
+import re
+from datetime import datetime
+
+# ==========================================
+# 1. CẤU HÌNH & LOAD DATA
+# ==========================================
+df = pd.read_csv('labeled_dataset.csv')
+
+def fix_path(path):
+    # Chuẩn hóa đường dẫn ảnh
+    if pd.isna(path): return ""
+    return path.replace('\\', '/').replace('../', '')
+
+# Hàm xử lý Tuổi và Giới tính từ 2 cột ketqua_Female/Male
+# Logic: Cột nào có dữ liệu (VD: "51 tuổi") thì là giới tính đó
+def extract_demographics(row):
+    age = 0
+    gender = 0 # 0: Male, 1: Female (Mặc định)
+    
+    # Check cột Female
+    if pd.notna(row['ketqua_Female']) and str(row['ketqua_Female']).strip() != "":
+        gender = 1 # Female
+        age_str = str(row['ketqua_Female'])
+    # Check cột Male
+    elif pd.notna(row['ketqua_Male']) and str(row['ketqua_Male']).strip() != "":
+        gender = 0 # Male
+        age_str = str(row['ketqua_Male'])
+    else:
+        # Nếu cả 2 cột text đều rỗng, thử lấy từ birth_year
+        current_year = datetime.now().year
+        birth_year = row.get('birth_year', row.get('ketqua_calc_birth_year', current_year))
+        age = current_year - birth_year if pd.notna(birth_year) else 0
+        return pd.Series([age, 0]) # Mặc định Male nếu ko rõ
+
+    # Parse số tuổi từ chuỗi "51 tuổi"
+    try:
+        age = int(re.search(r'\d+', age_str).group())
+    except:
+        # Fallback nếu parse lỗi: dùng birth_year
+        current_year = datetime.now().year
+        birth_year = row.get('birth_year', row.get('ketqua_calc_birth_year', current_year))
+        age = current_year - birth_year if pd.notna(birth_year) else 0
+        
+    return pd.Series([age, gender])
+
+print(">>> Đang xử lý dữ liệu...")
+
+# ==========================================
+# 2. FEATURE ENGINEERING (Tạo cột Age, Sex)
+# ==========================================
+# Tạo 2 cột mới từ dữ liệu thô
+df[['Age', 'Sex']] = df.apply(extract_demographics, axis=1)
+
+# Danh sách cột CHUẨN cần giữ lại cho Model
+keep_cols = [
+    'ketqua_ID',        # ID để gom nhóm (Study ID)
+    'filepath',         # INPUT 1: Ảnh (Visual)
+    'ketqua_Diagnose',  # INPUT 2: Chỉ định lâm sàng (Text Context)
+    'xray_type',        # INPUT 3: Vị trí chụp (Body Part)
+    'Age',              # INPUT 4: Tuổi
+    'Sex',              # INPUT 5: Giới tính
+    'clean_result',     # OUTPUT 1: Báo cáo kết quả (Ground Truth Text)
+    'label'             # OUTPUT 2: Nhãn bệnh (Ground Truth Class)
+]
+
+df_clean = df[keep_cols].copy()
+df_clean['filepath'] = df_clean['filepath'].apply(fix_path)
+
+# Chuyển label string sang list thật (nếu cần)
+df_clean['label'] = df_clean['label'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+
+# ==========================================
+# 3. GROUPING (Gom nhiều ảnh của 1 ca)
+# ==========================================
+print(">>> Đang gom nhóm theo Study ID...")
+
+df_grouped = df_clean.groupby('ketqua_ID').agg({
+    'filepath': list,              # Gom ảnh thành list: ['img1.jpg', 'img2.jpg']
+    'ketqua_Diagnose': 'first',    # Lấy chỉ định đầu tiên
+    'xray_type': 'first',          # Lấy loại chụp
+    'Age': 'max',                  # Lấy tuổi (max cho chắc)
+    'Sex': 'first',                # Lấy giới tính
+    'clean_result': 'first',       # Lấy kết quả text
+    'label': 'first'               # Lấy nhãn
+}).reset_index()
+
+# Lọc bỏ các ca không có file ảnh hoặc nhãn lỗi
+df_grouped = df_grouped[df_grouped['filepath'].map(len) > 0]
+
+print(f"Tổng số ca khám (Study) sau khi gom: {len(df_grouped)}")
+
+# ==========================================
+# 4. CLASS MAPPING & SPLITTING
+# ==========================================
+# Tạo từ điển nhãn
+all_labels = set()
+for labels in df_grouped['label']:
+    if isinstance(labels, list):
+        all_labels.update(labels)
+
+# Loại bỏ nhãn 'UNKNOWN' hoặc 'OTHER' khỏi mapping nếu bro không muốn train 2 nhãn này
+# (nhưng giữ lại trong data để test cũng được)
+if 'UNKNOWN' in all_labels: all_labels.remove('UNKNOWN')
+# if 'OTHER' in all_labels: all_labels.remove('OTHER') # Tùy bro quyết định
+
+label2id = {label: i for i, label in enumerate(sorted(list(all_labels)))}
+print(">>> Class Mapping:", label2id)
+
+# Lưu mapping
+with open('class_mapping.json', 'w', encoding='utf-8') as f:
+    json.dump(label2id, f, ensure_ascii=False, indent=4)
+
+# Chia tập Train/Val/Test (70/10/20)
+# Dùng label đầu tiên để stratify (cân bằng nhãn)
+stratify_col = df_grouped['label'].apply(lambda x: x[0] if len(x) > 0 and x[0] in label2id else "OTHER")
+
+train_val_df, test_df = train_test_split(df_grouped, test_size=0.2, random_state=42, stratify=stratify_col)
+
+# Cập nhật stratify cho vòng 2
+stratify_col_remain = train_val_df['label'].apply(lambda x: x[0] if len(x) > 0 and x[0] in label2id else "OTHER")
+train_df, val_df = train_test_split(train_val_df, test_size=0.125, random_state=42, stratify=stratify_col_remain)
+
+print(f">>> Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
+
+# ==========================================
+# 5. LƯU FILE
+# ==========================================
+train_df.to_csv('dataset_train.csv', index=False)
+val_df.to_csv('dataset_val.csv', index=False)
+test_df.to_csv('dataset_test.csv', index=False)
+
+print(">>> Xong! Đã có dataset_train.csv, dataset_val.csv, dataset_test.csv chuẩn chỉ.")
+
+
+Kết quả ra 3 bộ data và 1 file class_mapping.json như sau:
+{
+    "BRONCHITIS": 0,
+    "CARDIOMEGALY": 1,
+    "DEGENERATION": 2,
+    "FRACTURE": 3,
+    "HARDWARE/SURGERY": 4,
+    "NORMAL": 5,
+    "OTHER": 6,
+    "PLEURAL_EFFUSION": 7,
+    "PNEUMONIA/INFILTRATION": 8,
+    "SINUSITIS": 9,
+    "SOFT_TISSUE": 10,
+    "SPINAL_ALIGNMENT": 11,
+    "SPONDYLOSIS/DISC": 12,
+    "TUBERCULOSIS": 13
+}
+và số lượng mỗi bộ như sau: Train: 13387 | Val: 1913 | Test: 3825
+
+Bước 6: Resize dataset (folder ResizeData). Vì trong quá trình train thử bộ data ở bước 5, bộ data quá nặng mà lưu trên HDD nên train chậm, tui quyết định resize toàn bộ hình về 256x256 và lưu trên SSD để train nhanh hơn. Bộ 3 dataset sẽ qua code notebook ResizeData/resize_dataset.ipynb:
+# %%
+import pandas as pd
+import cv2
+import os
+import ast
+from tqdm import tqdm
+import shutil
+
+# CẤU HÌNH
+INPUT_CSV = 'dataset_train.csv' # Chạy lần lượt cho train/val/test
+OUTPUT_CSV = 'dataset_train_resized.csv'
+OUTPUT_DIR = 'J://XQUANGRESIZE/train' # Folder lưu ảnh mới
+IMG_SIZE = 256
+ROOT_DIR = 'J://'
+
+def process_and_save(input_csv, output_csv, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    df = pd.read_csv(input_csv)
+    
+    new_filepaths = []
+    
+    print(f"🚀 Bắt đầu resize {len(df)} studies từ {input_csv}...")
+    
+    # Duyệt qua từng dòng
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
+        # Parse đường dẫn ảnh gốc
+        original_paths = ast.literal_eval(row['filepath']) if isinstance(row['filepath'], str) else row['filepath']
+        
+        resized_paths_for_study = []
+        
+        for i, img_path in enumerate(original_paths):
+            if os.path.exists(ROOT_DIR + img_path):
+                # Tạo tên file mới: STUDYID_IMGINDEX.jpg
+                study_id = str(row['ketqua_ID'])
+                fname = f"{study_id}_{i}.jpg"
+                save_path = os.path.join(output_dir, fname)
+                
+                # Nếu file chưa tồn tại thì mới resize (để lỡ đứt mạng chạy lại cho nhanh)
+                if not os.path.exists(save_path):
+                    try:
+                        img = cv2.imread(ROOT_DIR + img_path)
+                        if img is not None:
+                            # Resize xuống 256x256
+                            img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+                            # Lưu ảnh nén JPG chất lượng 90 (nhẹ hều)
+                            cv2.imwrite(save_path, img_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                            resized_paths_for_study.append(save_path)
+                        else:
+                            # Ảnh lỗi -> Bỏ qua hoặc giữ nguyên logic xử lý sau
+                            pass
+                    except Exception as e:
+                        print(f"Lỗi ảnh {img_path}: {e}")
+                else:
+                    resized_paths_for_study.append(save_path)
+            else:
+                pass # File gốc không thấy
+        
+        # Lưu lại list đường dẫn mới
+        new_filepaths.append(resized_paths_for_study)
+    
+    # Cập nhật DataFrame và lưu CSV mới
+    df['filepath'] = new_filepaths
+    # Lọc bỏ những dòng không có ảnh nào sau khi resize
+    df = df[df['filepath'].map(len) > 0]
+    
+    df.to_csv(output_csv, index=False)
+    print(f"✅ Đã xong! File CSV mới: {output_csv}")
+
+if __name__ == "__main__":
+    # Resize tập Train
+    process_and_save('dataset_train.csv', 
+                     'dataset_train_resized.csv', 
+                     'C://XQUANGRESIZE/train')
+    
+    # Resize tập Val (Làm luôn cho đồng bộ)
+    process_and_save('dataset_val.csv', 
+                     'dataset_val_resized.csv', 
+                     'C://XQUANGRESIZE/val')
+    
+    # Resize tập Test
+    process_and_save('dataset_test.csv', 
+                     'dataset_test_resized.csv', 
+                     'C://XQUANGRESIZE/test')
+
+# %%
+import pandas as pd
+import ast
+# Change image paths in CSV files from C://XQUANGRESIZE/{split}\\{STUDYID}_{IMGINDEX}.jpg to C:\XQUANGRESIZE/{split}/{STUDYID}_{IMGINDEX}.jpg
+def fix_image_paths_in_csv(input_csv, output_csv):
+    df = pd.read_csv(input_csv)
+    
+    fixed_filepaths = []
+    
+    for idx, row in df.iterrows():
+        original_paths = ast.literal_eval(row['filepath']) if isinstance(row['filepath'], str) else row['filepath']
+        fixed_paths_for_study = []
+        
+        for img_path in original_paths:
+            # Sửa đường dẫn
+            fixed_path = img_path.replace('\\', '/')
+            fixed_path = fixed_path.replace('C://XQUANGRESIZE', "XQUANGRESIZE")
+            fixed_paths_for_study.append(fixed_path)
+        
+        fixed_filepaths.append(fixed_paths_for_study)
+    
+    df['filepath'] = fixed_filepaths
+    df.to_csv(output_csv, index=False)
+    print(f"✅ Đã sửa xong file CSV: {output_csv}")
+
+# Sửa đường dẫn trong các file CSV đã tạo
+fix_image_paths_in_csv('dataset_train_resized.csv', 'dataset_train_resized_fixed.csv')
+fix_image_paths_in_csv('dataset_val_resized.csv', 'dataset_val_resized_fixed.csv')
+fix_image_paths_in_csv('dataset_test_resized.csv', 'dataset_test_resized_fixed.csv')
+
+
+Kết quả thu về như sau:
+🚀 Bắt đầu resize 13387 studies từ dataset_train.csv...
+100%|██████████| 13387/13387 [01:44<00:00, 128.07it/s]
+✅ Đã xong! File CSV mới: dataset_train_resized.csv
+🚀 Bắt đầu resize 1913 studies từ dataset_val.csv...
+100%|██████████| 1913/1913 [00:06<00:00, 278.92it/s]
+✅ Đã xong! File CSV mới: dataset_val_resized.csv
+🚀 Bắt đầu resize 3825 studies từ dataset_test.csv...
+100%|██████████| 3825/3825 [00:08<00:00, 466.91it/s] 
+✅ Đã xong! File CSV mới: dataset_test_resized.csv
+
+✅ Đã sửa xong file CSV: dataset_train_resized_fixed.csv
+✅ Đã sửa xong file CSV: dataset_val_resized_fixed.csv
+✅ Đã sửa xong file CSV: dataset_test_resized_fixed.csv
+
+Bước 7: Cân bằng data (folder BalanceData). Bộ 3 data sau khi resize sẽ chạy qua code BalanceData/balance_data.ipynb để cân bằng dữ liệu:
+# %% [markdown]
+# # Balance dataset
+
+# %%
+import pandas as pd
+
+# %%
+data_train = pd.read_csv('data/dataset_train_resized_fixed.csv')
+data_test = pd.read_csv('data/dataset_test_resized_fixed.csv')
+data_val = pd.read_csv('data/dataset_val_resized_fixed.csv')
+
+# %%
+# Drop PELVIS, ELBOW, ABDOMEN, HUMERUS, FEMUR in xray_type column
+data_train = data_train[~data_train['xray_type'].isin(['PELVIS', 'ELBOW', 'ABDOMEN', 'HUMERUS', 'FEMUR'])]
+data_test = data_test[~data_test['xray_type'].isin(['PELVIS', 'ELBOW', 'ABDOMEN', 'HUMERUS', 'FEMUR'])]
+data_val = data_val[~data_val['xray_type'].isin(['PELVIS', 'ELBOW', 'ABDOMEN', 'HUMERUS', 'FEMUR'])]
+
+# Keep only age from 7 to 90 in Age column
+data_train = data_train[(data_train['Age'] >= 7) & (data_train['Age'] <= 90)]
+data_test = data_test[(data_test['Age'] >= 7) & (data_test['Age'] <= 90)]
+data_val = data_val[(data_val['Age'] >= 7) & (data_val['Age'] <= 90)]
+
+# %%
+# Analyze after balancing
+xray_types_train = data_train['xray_type'].value_counts()
+print(xray_types_train)
+xray_types_test = data_test['xray_type'].value_counts()
+print(xray_types_test)
+xray_types_val = data_val['xray_type'].value_counts()
+print(xray_types_val)
+
+# %%
+age_counts_train = data_train['Age'].value_counts().sort_index()
+print(age_counts_train)
+age_counts_train.plot(kind='bar', figsize=(20, 6))
+
+age_counts_test = data_test['Age'].value_counts().sort_index()
+print(age_counts_test)
+age_counts_test.plot(kind='bar', figsize=(20, 6))
+
+age_counts_val = data_val['Age'].value_counts().sort_index()
+print(age_counts_val)
+age_counts_val.plot(kind='bar', figsize=(20, 6))
+
+# %%
+# Save the balanced datasets
+data_train.to_csv('balancedData/dataset_train_resized_balanced.csv', index=False)
+data_test.to_csv('balancedData/dataset_test_resized_balanced.csv', index=False)
+data_val.to_csv('balancedData/dataset_val_resized_balanced.csv', index=False)
+
+# %% [markdown]
+# # Balance label dataset
+
+# %%
+# Check balance data in label column after balancing
+label_counts_train = data_train['label'].value_counts()
+print(label_counts_train)
+label_counts_test = data_test['label'].value_counts()
+print(label_counts_test)
+label_counts_val = data_val['label'].value_counts()
+print(label_counts_val)
+
+
+Kết quả thu về là bộ 3 data đã resize và cân bằng.
+
+
+
