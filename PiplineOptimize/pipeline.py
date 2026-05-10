@@ -287,7 +287,9 @@ class MedicalXRayPipeline:
         BƯỚC 1: Quét OCR ảnh để lấy text / STEP 1: OCR Extraction
         Sử dụng docTr + Multiprocessing + GPU Batching.
         """
+        self.logger.info("\n" + "="*60)
         self.logger.info("=== BƯỚC 1: BẮT ĐẦU TRÍCH XUẤT TEXT (OCR) ===")
+        self.logger.info("="*60)
         
         processed_files = set()
         if os.path.exists(self.ckpt_step1):
@@ -320,35 +322,57 @@ class MedicalXRayPipeline:
             self.logger.error(f"❌ Lỗi load mô hình docTr: {e}")
             raise
 
-        num_workers = min(4, cpu_count() * 2)
+        num_workers = min(8, cpu_count() * 2) # Tăng worker để đọc ảnh HDD
         results = []
         total_processed_count = 0
 
+        def validate_and_cache_image(path):
+            """Đọc thử ảnh bằng OpenCV để kiểm tra file lỗi và đưa vào OS Cache"""
+            try:
+                full_path = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+                img = cv2.imread(full_path)
+                if img is not None:
+                    del img # Giải phóng ngay RAM, chỉ giữ file trong OS Cache
+                    return path
+            except Exception: pass
+            return None
+
         # Processing loop
+        import gc
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             for i in tqdm(range(0, len(image_paths), self.gpu_batch_size), desc="🚀 Processing Batches"):
                 batch_paths = image_paths[i : i + self.gpu_batch_size]
-                doc_data_batch = list(executor.map(self.load_doc_safe, batch_paths))
                 
-                valid_docs, valid_paths = [], []
-                for path, doc in doc_data_batch:
-                    if doc:
-                        valid_docs.append(doc)
-                        valid_paths.append(path)
-                    else:
-                        self.logger.warning(f"⚠️ Bỏ qua file lỗi khi load: {path}")
+                # Load ảnh đa luồng để lọc file hỏng và đưa file vào OS Disk Cache
+                validated_paths = list(executor.map(validate_and_cache_image, batch_paths))
+                
+                valid_paths = [p for p in validated_paths if p is not None]
+                if not valid_paths: continue
 
-                if not valid_docs: continue
-
-                for path, doc in zip(valid_paths, valid_docs):
-                    try:
+                try:
+                    # Tách thành các mini-batch nhỏ hơn (ví dụ 16) để tránh tràn RAM 32GB
+                    # Việc đưa 128 ảnh X-Quang độ phân giải cao vào RAM cùng lúc sẽ ngốn >20GB
+                    mini_batch_size = 16
+                    for j in range(0, len(valid_paths), mini_batch_size):
+                        mini_paths = valid_paths[j : j + mini_batch_size]
+                        
+                        doc = DocumentFile.from_images(mini_paths)
                         output = model(doc) 
-                        text = self.extract_text_from_doctr(output)
-                        results.append({"file_path": path, "extracted_text": text})
-                        total_processed_count += 1
-                    except Exception as e:
-                        self.logger.error(f"💥 Lỗi khi infer ảnh {path}: {e}")
-                        continue
+                        
+                        # Extract text
+                        for path, page in zip(mini_paths, output.pages):
+                            text = " ".join([word.value for block in page.blocks for line in block.lines for word in line.words]).replace("\n", " ").strip()
+                            results.append({"file_path": path, "extracted_text": text})
+                            total_processed_count += 1
+                            
+                        # Giải phóng bộ nhớ khẩn cấp / Force GC
+                        del doc
+                        del output
+                        gc.collect()
+                        
+                except Exception as e:
+                    self.logger.error(f"💥 Lỗi khi infer batch ảnh: {e}")
+                    continue
 
                 # Lưu checkpoint / Save checkpoint
                 if len(results) >= self.ocr_checkpoint_every:
@@ -374,7 +398,9 @@ class MedicalXRayPipeline:
         BƯỚC 2: Clean data & Cứu data lỗi OCR / STEP 2: Cleaning & Rescue
         Sử dụng Regex và EasyOCR cho những ca bị thiếu.
         """
+        self.logger.info("\n" + "="*60)
         self.logger.info("=== BƯỚC 2: BẮT ĐẦU LÀM SẠCH VÀ CỨU DỮ LIỆU ===")
+        self.logger.info("="*60)
         
         if os.path.exists(self.ckpt_step2):
             self.logger.info(f"🔁 Load checkpoint Bước 2 từ file.")
@@ -423,33 +449,45 @@ class MedicalXRayPipeline:
             try:
                 reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
                 
-                for idx, row in tqdm(df_missing.iterrows(), total=len(df_missing), desc="Rescue OCR"):
+                # Tối ưu hóa: Đọc ảnh và crop song song bằng CPU (giảm nghẽn HDD), infer trên GPU
+                def prepare_crop(row_data):
+                    idx, row = row_data
                     img_path = row['filepath']
                     try:
-                        # Đảm bảo đường dẫn tuyệt đối đúng nếu cần / Ensure absolute path
                         full_img_path = img_path if os.path.isabs(img_path) else os.path.join(os.getcwd(), img_path)
                         img = cv2.imread(full_img_path)
-                        if img is None: continue
+                        if img is None: return idx, None
                         
                         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                        # Crop góc chứa thông tin / Crop header
                         h, w = gray.shape
-                        crop_h = min(500, h)
-                        crop_w = min(1000, w)
-                        gray_crop = gray[0:crop_h, 0:crop_w]
+                        gray_crop = gray[0:min(500, h), 0:min(1000, w)]
+                        return idx, gray_crop
+                    except Exception:
+                        return idx, None
+
+                # Tối ưu hóa: Xử lý theo chunk để tránh Memory Leak do giữ quá nhiều Futures trong RAM
+                chunk_size = 500
+                import gc
+                for chunk_idx in range(0, len(df_missing), chunk_size):
+                    chunk_df = df_missing.iloc[chunk_idx : chunk_idx + chunk_size]
+                    
+                    # Đọc ảnh đa luồng
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, cpu_count() * 2)) as executor:
+                        crop_results = list(executor.map(prepare_crop, chunk_df.iterrows()))
+                    
+                    # Inference tuần tự trên GPU
+                    for idx, gray_crop in tqdm(crop_results, desc=f"Rescue OCR Chunk {chunk_idx//chunk_size + 1}"):
+                        if gray_crop is None: continue
+                        try:
+                            ocr_res = reader.readtext(gray_crop)
+                            if len(ocr_res) >= 3 and pd.isna(df_missing.at[idx, 'patient_name']):
+                                df_missing.at[idx, 'patient_name'] = str(ocr_res[2][1])
+                            if len(ocr_res) >= 4 and pd.isna(df_missing.at[idx, 'xray_type']):
+                                df_missing.at[idx, 'xray_type'] = str(ocr_res[3][1])
+                        except Exception: pass
                         
-                        ocr_res = reader.readtext(gray_crop)
-                        
-                        # Heuristic đơn giản lấy dòng 2 và 3 (theo code gốc của người dùng)
-                        # Trong thực tế có thể cần rule chắc chắn hơn, nhưng tôn trọng logic người dùng
-                        if len(ocr_res) >= 3 and pd.isna(row['patient_name']):
-                            df_missing.at[idx, 'patient_name'] = str(ocr_res[2][1])
-                        if len(ocr_res) >= 4 and pd.isna(row['xray_type']):
-                            df_missing.at[idx, 'xray_type'] = str(ocr_res[3][1])
-                            
-                    except Exception as e:
-                        # Lỗi ảnh lẻ thì bỏ qua / Skip bad images
-                        pass
+                    del crop_results
+                    gc.collect()
 
                 # Xóa rác ký tự / Clean characters for rescued names
                 df_missing['patient_name'] = df_missing['patient_name'].astype(str).str.replace(r'[^a-zA-Z\s]', '', regex=True).str.upper()
@@ -486,16 +524,18 @@ class MedicalXRayPipeline:
         """
         BƯỚC 3: Matching với file bệnh viện / STEP 3: Hospital Records Matching
         """
+        self.logger.info("\n" + "="*60)
         self.logger.info("=== BƯỚC 3: BẮT ĐẦU MATCHING KẾT QUẢ BỆNH VIỆN ===")
+        self.logger.info("="*60)
         
         if os.path.exists(self.ckpt_step3):
-            self.logger.info(f"🔁 Load checkpoint Bước 3 từ file.")
+            self.logger.info(f"Load checkpoint Bước 3 từ file.")
             return pd.read_csv(self.ckpt_step3)
 
         try:
             df_ketqua = pd.read_csv(self.hospital_csv_path)
         except Exception as e:
-            self.logger.error(f"❌ Không tìm thấy file {self.hospital_csv_path}. {e}")
+            self.logger.error(f"Không tìm thấy file {self.hospital_csv_path}. {e}")
             raise
 
         # Preprocessing cho Matching
@@ -570,7 +610,7 @@ class MedicalXRayPipeline:
                 return best_idx, best_score, status
             return None, best_score, "Low Score"
 
-        self.logger.info("🔍 Đang chạy Matching Pass 1 (Strict)...")
+        self.logger.info("Đang chạy Matching Pass 1 (Strict)...")
         results = []
         for i, row in tqdm(df_xray.iterrows(), total=len(df_xray), desc="Strict Match"):
             match_idx, score, status = find_match(row, df_ketqua, mode="strict")
@@ -583,7 +623,7 @@ class MedicalXRayPipeline:
         df_results = pd.DataFrame(results)
         df_final = df_xray.join(df_results.set_index('xray_index'))
 
-        self.logger.info("🚑 Đang chạy Matching Pass 2 (Rescue +/- 3 ngày)...")
+        self.logger.info("Đang chạy Matching Pass 2 (Rescue +/- 3 ngày)...")
         mask_miss = df_final['match_status'] != 'Matched'
         indices_to_rescue = df_final[mask_miss].index
         
@@ -603,7 +643,7 @@ class MedicalXRayPipeline:
         # Chỉ giữ lại các ca đã Match
         df_matched_only = df_final[df_final['match_status'].str.contains('Matched', na=False)].copy()
         
-        self.logger.info(f"✅ Hoàn tất BƯỚC 3. Cứu được {rescued_count} ca. Tổng số match: {len(df_matched_only)}")
+        self.logger.info(f"Hoàn tất BƯỚC 3. Cứu được {rescued_count} ca. Tổng số match: {len(df_matched_only)}")
         df_matched_only.to_csv(self.ckpt_step3, index=False)
         return df_matched_only
 
@@ -612,10 +652,12 @@ class MedicalXRayPipeline:
         """
         BƯỚC 4: Gán nhãn tự động / STEP 4: Auto Labeling
         """
+        self.logger.info("\n" + "="*60)
         self.logger.info("=== BƯỚC 4: BẮT ĐẦU GÁN NHÃN TỰ ĐỘNG ===")
+        self.logger.info("="*60)
         
         if os.path.exists(self.ckpt_step4):
-            self.logger.info(f"🔁 Load checkpoint Bước 4 từ file.")
+            self.logger.info(f"Load checkpoint Bước 4 từ file.")
             return pd.read_csv(self.ckpt_step4)
 
         df_matched['clean_result'] = df_matched['ketqua_Result'].apply(self.clean_result_text)
@@ -625,7 +667,7 @@ class MedicalXRayPipeline:
         df_matched['label_str'] = df_matched['label'].apply(json.dumps)
 
         df_matched.to_csv(self.ckpt_step4, index=False)
-        self.logger.info(f"✅ Hoàn tất BƯỚC 4. Đã gán nhãn cho {len(df_matched)} bản ghi.")
+        self.logger.info(f"Hoàn tất BƯỚC 4. Đã gán nhãn cho {len(df_matched)} bản ghi.")
         return df_matched
 
 
@@ -634,7 +676,9 @@ class MedicalXRayPipeline:
         BƯỚC 5: Trích xuất đặc trưng (Tuổi, Giới tính) và chia Train/Val/Test
         STEP 5: Feature Engineering & Dataset Split
         """
+        self.logger.info("\n" + "="*60)
         self.logger.info("=== BƯỚC 5: BẮT ĐẦU TẠO FEATURE & SPLIT DATA ===")
+        self.logger.info("="*60)
         
         # Convert string label back to list
         df_labeled['label'] = df_labeled['label_str'].apply(lambda x: json.loads(x) if isinstance(x, str) else x)
@@ -676,7 +720,7 @@ class MedicalXRayPipeline:
         df_clean['filepath'] = df_clean['filepath'].astype(str).apply(lambda p: p.replace('\\', '/').replace('../', ''))
 
         # Gom nhóm theo ca khám (Group by Study ID)
-        self.logger.info("🧬 Đang gom nhóm theo ketqua_ID (Study ID)...")
+        self.logger.info("Đang gom nhóm theo ketqua_ID (Study ID)...")
         df_grouped = df_clean.groupby('ketqua_ID').agg({
             'filepath': list,
             'ketqua_Diagnose': 'first',
@@ -704,16 +748,32 @@ class MedicalXRayPipeline:
         self.logger.info(f"Đã lưu class_mapping.json với {len(label2id)} classes.")
 
         # Stratified Split (70/10/20)
-        stratify_col = df_grouped['label'].apply(lambda x: x[0] if len(x) > 0 and x[0] in label2id else "OTHER")
+        # Lấy nhãn đại diện cho Stratify, gán 'OTHER' nếu class có số lượng quá ít để phân chia
+        def get_stratify_label(x):
+            if not isinstance(x, list) or len(x) == 0: return "OTHER"
+            lbl = x[0]
+            # Nếu nhãn xuất hiện quá ít, gộp vào 'OTHER' để tránh lỗi
+            if (df_grouped['label'].apply(lambda l: isinstance(l, list) and len(l) > 0 and lbl == l[0]).sum()) < 5: 
+                return "OTHER"
+            return lbl
+
+        stratify_col = df_grouped['label'].apply(get_stratify_label)
+        
+        # Kiểm tra an toàn trước khi split
+        stratify_1 = stratify_col if stratify_col.value_counts().min() >= 2 else None
+        if stratify_1 is None:
+            self.logger.warning("⚠️ Data quá nhỏ, một số class < 2 mẫu. Sẽ dùng Random Split thay vì Stratified Split.")
         
         # Split TrainVal / Test (80/20)
-        train_val_df, test_df = train_test_split(df_grouped, test_size=0.2, random_state=42, stratify=stratify_col)
+        train_val_df, test_df = train_test_split(df_grouped, test_size=0.2, random_state=42, stratify=stratify_1)
         
         # Split Train / Val (87.5% của 80% = 70% tổng, 12.5% của 80% = 10% tổng)
-        stratify_col_remain = train_val_df['label'].apply(lambda x: x[0] if len(x) > 0 and x[0] in label2id else "OTHER")
-        train_df, val_df = train_test_split(train_val_df, test_size=0.125, random_state=42, stratify=stratify_col_remain)
+        stratify_col_remain = train_val_df['label'].apply(get_stratify_label)
+        stratify_2 = stratify_col_remain if stratify_col_remain.value_counts().min() >= 2 else None
+        
+        train_df, val_df = train_test_split(train_val_df, test_size=0.125, random_state=42, stratify=stratify_2)
 
-        self.logger.info(f"✅ Hoàn tất BƯỚC 5. Split: Train({len(train_df)}) | Val({len(val_df)}) | Test({len(test_df)})")
+        self.logger.info(f"Hoàn tất BƯỚC 5. Split: Train({len(train_df)}) | Val({len(val_df)}) | Test({len(test_df)})")
         return train_df, val_df, test_df
 
 
@@ -721,7 +781,9 @@ class MedicalXRayPipeline:
         """
         BƯỚC 6 & 7: Cân bằng nhãn và Resize ảnh / STEP 6 & 7: Balance & Resize
         """
+        self.logger.info("\n" + "="*60)
         self.logger.info("=== BƯỚC 6 & 7: BẮT ĐẦU CÂN BẰNG DATA VÀ RESIZE ẢNH SANG SSD ===")
+        self.logger.info("="*60)
         
         def process_split(df, split_name):
             # 1. Balancing (Lọc dữ liệu) / Filter Data
@@ -782,13 +844,15 @@ class MedicalXRayPipeline:
         val_final = process_split(val_df, "val")
         test_final = process_split(test_df, "test")
 
-        self.logger.info("🎉 HOÀN TẤT TOÀN BỘ QUY TRÌNH!")
+        self.logger.info("HOÀN TẤT TOÀN BỘ QUY TRÌNH!")
         return train_final, val_final, test_final
 
     
     def run_pipeline(self):
         """Hàm chạy toàn bộ pipeline / Execute full pipeline"""
+        self.logger.info("\n" + "#"*60)
         self.logger.info("🚀 BẮT ĐẦU END-TO-END MEDICAL X-RAY PIPELINE")
+        self.logger.info("#"*60)
         start_time = time.time()
         
         try:
@@ -800,10 +864,10 @@ class MedicalXRayPipeline:
             self.step6_7_balance_and_resize(train_df, val_df, test_df)
             
             end_time = time.time()
-            self.logger.info(f"💯 PIPELINE SUCCESSFUL. Total time: {(end_time - start_time)/60:.2f} mins")
+            self.logger.info(f"PIPELINE SUCCESSFUL. Total time: {(end_time - start_time)/60:.2f} mins")
             
         except Exception as e:
-            self.logger.error(f"❌ PIPELINE FAILED OR INTERRUPTED. Lỗi hệ thống: {e}")
+            self.logger.error(f"PIPELINE FAILED OR INTERRUPTED. Lỗi hệ thống: {e}")
             self.logger.error(traceback.format_exc())
 
 # === END OF CLASS ===
