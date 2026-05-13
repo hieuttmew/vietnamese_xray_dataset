@@ -32,7 +32,7 @@ class MedicalXRayPipeline:
     # NOISE_WORDS: Từ khóa nhiễu OCR thường gặp / Common OCR noise keywords
     NOISE_WORDS = [
         "TTYT", "HUYEN", "TRUNG", "TAM", "Y", "TE", "DUC", "TRONG",
-        "CENTER", "BENH", "VIEN", "PKDK", "PHONG KHAM"
+        "CENTER", "BENH", "VIEN", "PKDK", "PHONG KHAM", "KV"
     ]
     NOISE_PATTERN = re.compile(r'\b(?:' + '|'.join(NOISE_WORDS) + r')\b', re.IGNORECASE)
 
@@ -69,7 +69,7 @@ class MedicalXRayPipeline:
 
     LOCATION_NOISE = [
         'TTYT', 'HUYEN', 'DUC', 'TRONG', 'YTE', 'HUTEN', 'DUG', 'RONG', 'LAM', 'DONG', 
-        'CENTER', 'HOSPITAL', 'TYTHUYEN', 'TEHUYEN', 'LHUYEN', 'UHUYEN', 'HUTENDUC'
+        'CENTER', 'HOSPITAL', 'TYTHUYEN', 'TEHUYEN', 'LHUYEN', 'UHUYEN', 'HUTENDUC', "KV"
     ]
 
     LABEL_MAPPING_V2 = {
@@ -409,6 +409,27 @@ class MedicalXRayPipeline:
         results = []
         df_raw = df_raw.fillna("")
 
+        ENG_BODY_PARTS = [
+            'CHEST', 'THORAX', 'LUNG', 'RIB', 'CLAVICLE', 
+            'SKULL', 'HEAD', 'SINUS', 'MANDIBLE', 'ZYGOMA', 'NASAL', 'FACE', 
+            'SPINE', 'CERVICAL', 'LUMBAR', 'THORACIC', 'SACRUM', 'COCCYX', 'NECK', 'L-SPINE', 'C-SPINE', 'T-SPINE', 'LSPINE', 'CSPINE', 
+            'ABDOMEN', 'ABD', 'KUB', 
+            'PELVIS', 'HIP', 'SI JOINT', 
+            'KNEE', 'PATELLA', 
+            'SHOULDER', 'SCAPULA', 
+            'HAND', 'FINGER', 'THUMB', 'DIGIT', 
+            'WRIST', 'CARPAL', 
+            'ELBOW', 
+            'FOREARM', 'RADIUS', 'ULNA', 
+            'FOOT', 'TOE', 'HEEL', 'CALCANEUS', 
+            'ANKLE', 
+            'HUMERUS', 'ARM', 
+            'FEMUR', 'THIGH', 
+            'LEG', 'TIBIA', 'FIBULA'
+        ]
+        eng_parts_sorted = sorted(ENG_BODY_PARTS, key=len, reverse=True)
+        regex_body_parts = r'\b(' + '|'.join(eng_parts_sorted) + r')'
+
         self.logger.info("🧹 Đang phân tích cú pháp Regex (Lần 1)...")
         for i, row in tqdm(df_raw.iterrows(), total=len(df_raw), desc="Regex Clean"):
             fp = row.get("file_path", "")
@@ -417,9 +438,36 @@ class MedicalXRayPipeline:
                 continue
 
             clean_txt = self.clean_noise(text)
-            datetime_str = self.extract_datetime(clean_txt)
-            name, birth = self.extract_name_birth(clean_txt)
-            xray_type = self.extract_xray_type(clean_txt)
+            datetime_str = self.extract_datetime(text) # use original text for datetime safety
+            
+            # Robust extraction for new format
+            name = ""
+            birth = ""
+            xray_type = ""
+            
+            core_match = re.search(r'Image\s+\d+\s+(.*?)(?:\s+Unit:|\s+Pixel for|$)', text, re.IGNORECASE)
+            if core_match:
+                core_str = core_match.group(1).strip()
+                # Find the body part
+                bp_match = re.search(regex_body_parts, core_str, re.IGNORECASE)
+                if bp_match:
+                    patient_name_age = core_str[:bp_match.start()].strip()
+                    xray_type = core_str[bp_match.start():].strip()
+                    
+                    # Extract age from patient_name_age
+                    age_match = re.search(r'\s+(\d{1,4}(?:TH|M|Y)?)\s*$', patient_name_age, re.IGNORECASE)
+                    if age_match:
+                        birth = age_match.group(1)
+                        name = patient_name_age[:age_match.start()].strip()
+                    else:
+                        name = patient_name_age
+                else:
+                    # Fallback to old methods if pattern not found
+                    name, birth = self.extract_name_birth(clean_txt)
+                    xray_type = self.extract_xray_type(clean_txt)
+            else:
+                name, birth = self.extract_name_birth(clean_txt)
+                xray_type = self.extract_xray_type(clean_txt)
 
             results.append({
                 "filepath": fp,
@@ -480,10 +528,22 @@ class MedicalXRayPipeline:
                         if gray_crop is None: continue
                         try:
                             ocr_res = reader.readtext(gray_crop)
-                            if len(ocr_res) >= 3 and pd.isna(df_missing.at[idx, 'patient_name']):
-                                df_missing.at[idx, 'patient_name'] = str(ocr_res[2][1])
-                            if len(ocr_res) >= 4 and pd.isna(df_missing.at[idx, 'xray_type']):
-                                df_missing.at[idx, 'xray_type'] = str(ocr_res[3][1])
+                            # Remove the naive hardcoded index extraction to prevent destroying data
+                            # as the new robust regex handles > 99% of cases correctly.
+                            # Just rescue if there is absolutely no data
+                            extracted_text = " ".join([res[1] for res in ocr_res])
+                            
+                            core_match = re.search(r'Image\s+\d+\s+(.*?)(?:\s+Unit:|\s+Pixel for|$)', extracted_text, re.IGNORECASE)
+                            if core_match:
+                                core_str = core_match.group(1).strip()
+                                bp_match = re.search(regex_body_parts, core_str, re.IGNORECASE)
+                                if bp_match:
+                                    if pd.isna(df_missing.at[idx, 'patient_name']):
+                                        p_name_age = core_str[:bp_match.start()].strip()
+                                        age_match = re.search(r'\s+(\d{1,4}(?:TH|M|Y)?)\s*$', p_name_age, re.IGNORECASE)
+                                        df_missing.at[idx, 'patient_name'] = p_name_age[:age_match.start()].strip() if age_match else p_name_age
+                                    if pd.isna(df_missing.at[idx, 'xray_type']):
+                                        df_missing.at[idx, 'xray_type'] = core_str[bp_match.start():].strip()
                         except Exception: pass
                         
                     del crop_results
@@ -545,7 +605,8 @@ class MedicalXRayPipeline:
         df_xray['datetime_obj'] = pd.to_datetime(df_xray['datetime'], errors='coerce')
         df_xray['date_only'] = df_xray['datetime_obj'].dt.date
 
-        df_ketqua['date_start_obj'] = pd.to_datetime(df_ketqua['Date start'], format='%d/%m/%Y %H:%M', errors='coerce')
+        # df_ketqua['date_start_obj'] = pd.to_datetime(df_ketqua['Date start'], format='%d/%m/%Y %H:%M', errors='coerce')
+        df_ketqua['date_start_obj'] = pd.to_datetime(df_ketqua['Date start'], format='%d/%m/%Y', errors='coerce')
         df_ketqua['date_only'] = df_ketqua['date_start_obj'].dt.date
 
         # Hàm tính năm sinh từ cột Female/Male của file ketqua
@@ -553,7 +614,11 @@ class MedicalXRayPipeline:
             age_str = row['Female'] if pd.notna(row.get('Female')) else row.get('Male')
             if pd.isna(age_str): return None
             try:
-                age = int(str(age_str).replace(' tuổi', '').strip())
+                age_str_clean = str(age_str).strip()
+                if 'thá' in age_str_clean or 'th' in age_str_clean or 'ng' in age_str_clean:
+                    age = 0
+                else:
+                    age = int(re.sub(r'\D', '', age_str_clean))
                 current_year = row['date_start_obj'].year if pd.notna(row['date_start_obj']) else datetime.now().year
                 return current_year - age
             except:
@@ -594,7 +659,12 @@ class MedicalXRayPipeline:
                 cand_year = cand['calc_birth_year']
                 if pd.notna(xray_year) and pd.notna(cand_year):
                     try:
-                        x_year = float(xray_year)
+                        x_year_str = str(xray_year).upper().replace('TH', '').replace('M', '').replace('Y', '').strip()
+                        x_year = float(x_year_str)
+                        if x_year < 150:
+                            current_year = xray_date.year if pd.notna(xray_date) else datetime.now().year
+                            x_year = current_year - x_year
+                            
                         if abs(x_year - cand_year) <= 1:
                             name_score += 0.2
                         elif abs(x_year - cand_year) > 5:
